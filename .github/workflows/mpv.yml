@@ -72,7 +72,7 @@ jobs:
         with:
           script: |
             const commit = await github.rest.repos.getCommit({
-              owner: 'mpv-player',
+              owner: 'the-database',
               repo: 'mpv',
               ref: `master`
             })
@@ -206,6 +206,9 @@ jobs:
           echo "cache_suffix=$(date "+%Y-%m-%d")-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
+          # Use the-database/mpv as the mpv source (carries the seek-speedup patch)
+          sed -i 's|mpv-player/mpv\.git|the-database/mpv.git|g' \
+              mpv-winbuild-cmake/packages/mpv.cmake
 
       - name: Lookup Toolchain Cache
         id: lookup_toolchain
