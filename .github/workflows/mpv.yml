@@ -12,7 +12,7 @@ on:
       build_target:
         description: "Build target"
         required: false
-        default: "all-64bit"
+        default: "64bit"
         type: choice
         options:
         - 32bit
@@ -46,7 +46,7 @@ on:
       release:
         description: "Publish a release"
         required: false
-        default: false
+        default: true
         type: boolean
       command:
         description: 'input command you want to run before build'
@@ -71,12 +71,8 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const commit = await github.rest.repos.getCommit({
-              owner: 'the-database',
-              repo: 'mpv',
-              ref: `master`
-            })
-            core.setOutput('sha', String(commit.data.sha))
+            const fixed_mpv_sha = '9bb5fe9680718d6b9f654ee8e978caf0280b9a27';
+            core.setOutput('sha', fixed_mpv_sha)
             
             let matrix = {};
             let build_target = "${{ inputs.build_target }}"
@@ -192,11 +188,24 @@ jobs:
           git config --global pull.rebase true
           git config --global rebase.autoStash true
           git config --global fetch.prune true
-      - uses: actions/checkout@v6
+      - name: Checkout current repository for local patches
+        uses: actions/checkout@v6
+        with:
+          path: _self
+
+      - name: Checkout 2026-06-18 mpv-winbuild wrapper
+        uses: actions/checkout@v6
+        with:
+          repository: the-database/mpv-winbuild
+          ref: 8c5353dc3fa0b0522af309b4793c9f62369e3422
+          path: wrapper
+          fetch-depth: 1
+
       - name: Checkout toolchain
         uses: actions/checkout@v6
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: 5efd298cb51513c2410e4e9029b5e56b83c2aaac
           path: mpv-winbuild-cmake
           fetch-depth: 0
       - name: Prepare
@@ -324,19 +333,33 @@ jobs:
           cp mpv-patch/*.patch mpv-winbuild-cmake/packages
           ls mpv-winbuild-cmake/packages/mpv-*.patch
           cd mpv-winbuild-cmake
-          if [[ "$(ls -A ../patch_pr/0000-*.patch)" ]]; then
-            for patch in ../patch_pr/0000-*.patch ; do
+          if [[ "$(ls -A ../wrapper/patch_pr/0000-*.patch)" ]]; then
+            for patch in ../wrapper/patch_pr/0000-*.patch ; do
               git am --3way "$patch" || git am --abort
             done
           fi
           for patch in packages/mpv-*.patch ; do
             pr="$(echo ${patch#*#} | cut -d- -f1)"
-            if [[ "$(ls -A ../patch_pr/#${pr}-*.patch)" ]]; then
-              for p in ../patch_pr/#${pr}-*.patch ; do
+            if [[ "$(ls -A ../wrapper/patch_pr/#${pr}-*.patch)" ]]; then
+              for p in ../wrapper/patch_pr/#${pr}-*.patch ; do
                 git am --3way "$p" || git am --abort
               done
             fi
           done
+
+      - name: Add local mpv patches
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p mpv-winbuild-cmake/packages
+          patches=( _self/local_mpv_patches/mpv-*.patch )
+          if (( ${#patches[@]} )); then
+            cp "${patches[@]}" mpv-winbuild-cmake/packages/
+            echo "local mpv patches copied:"
+            ls -l mpv-winbuild-cmake/packages/mpv-*.patch
+          else
+            echo "no local mpv patches found"
+          fi
 
       - name: Running custom command
         if: ${{ inputs.command != '' }}
@@ -381,23 +404,60 @@ jobs:
         id: build
         shell: bash
         run: |
-          chmod +x build.sh
+          chmod +x wrapper/build.sh
           cd mpv-winbuild-cmake
-          if [[ "$(ls -A ../patch/*.patch)" ]]; then
-            for patch in ../patch/*.patch ; do
+          if [[ "$(ls -A ../wrapper/patch/*.patch)" ]]; then
+            for patch in ../wrapper/patch/*.patch ; do
               git am --3way "$patch" || git am --abort
             done
           fi
           if [ "${{ matrix.lgpl }}" = "true" ]; then
-            git am --3way ../compile-lgpl-libmpv.patch
+            git am --3way ../wrapper/compile-lgpl-libmpv.patch
           fi
-          # Use the-database/mpv as the mpv source (carries the seek-speedup
-          # patch). Must run AFTER zhongfly's patch series (they also touch
-          # mpv.cmake) and BEFORE the build, so commit as a normal change.
+          # Use the-database/mpv as the mpv source and pin it to the
+          # 2026-06-18 working AnimeJaNai snapshot. This workflow itself may live
+          # on a newer fork, but the build wrapper and package patches above are
+          # taken from the 8c5353dc snapshot.
           sed -i 's|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
+          sed -i '/GIT_REPOSITORY .*mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
+
+          # Enable packages/mpv-*.patch support when local fps patches are present.
+          if compgen -G "packages/mpv-*.patch" > /dev/null; then
+            if ! grep -q 'PATCH_COMMAND.*mpv-\*.patch' packages/mpv.cmake; then
+              git am --3way ../wrapper/patch_pr/0000-mpv-add-patch.patch || git am --abort
+            fi
+          fi
+
           git add packages/mpv.cmake && \
-            git -c user.name=ci -c user.email=ci@local commit -m "redirect mpv source"
-          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
+            git -c user.name=ci -c user.email=ci@local commit -m "redirect and pin mpv source"
+
+          # If a source cache restored a newer mpv checkout, force only mpv back
+          # to the known working commit. Do not reset every dependency here.
+          if [ -d src_packages/mpv/.git ]; then
+            git -C src_packages/mpv remote set-url origin https://github.com/the-database/mpv.git || true
+            if [ "$(git -C src_packages/mpv rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+              git -C src_packages/mpv fetch --unshallow --force --tags origin +refs/heads/master:refs/remotes/origin/master || true
+            else
+              git -C src_packages/mpv fetch --force --tags origin +refs/heads/master:refs/remotes/origin/master || true
+            fi
+            if ! git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}; then
+              git -C src_packages/mpv fetch --force origin 9bb5fe9680718d6b9f654ee8e978caf0280b9a27 || true
+            fi
+            git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}
+            git -C src_packages/mpv reset --hard 9bb5fe9680718d6b9f654ee8e978caf0280b9a27
+            git -C src_packages/mpv clean -fdx
+          fi
+
+          # Force mpv ExternalProject to re-run download/patch/configure if a
+          # build cache restored stale stamps from a newer build.
+          rm -rf build${{ matrix.bit }}/packages/mpv-prefix || true
+
+          echo "=== effective mpv.cmake ==="
+          grep -n -A8 -B4 'GIT_REPOSITORY .*mpv' packages/mpv.cmake
+          echo "=== local mpv patches ==="
+          ls -l packages/mpv-*.patch || true
+
+          bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Collect logs
         if: ${{ always() }}
         run: |
@@ -659,7 +719,7 @@ jobs:
         with:
           script: |
             const sha = `${{ needs.params.outputs.sha }}`;
-            let note = `**MPV Git commit**: https://github.com/mpv-player/mpv/commit/${sha}\n`;
+            let note = `**MPV Git commit**: https://github.com/the-database/mpv/commit/${sha}\n`;
             note+="**Build Time**: ${{ env.long_time }}\n";
             note+="**Compiler**: ${{ inputs.compiler }}\n";
             note+="**Build Details**: https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}\n";

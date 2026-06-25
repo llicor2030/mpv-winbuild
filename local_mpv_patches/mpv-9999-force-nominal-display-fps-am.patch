@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: local <local@example.invalid>
+Date: Thu, 25 Jun 2026 00:00:00 +0000
+Subject: [PATCH] vo: force nominal display fps for display-sync
+
+Windows Vulkan/present paths can report a correct specified display FPS
+(for example exact 24000/1001) while the measured refresh converges near
+24/1.  If accepted, display-sync can pull NTSC-rate video to 24.000.
+
+For this custom build, keep display-sync on the specified/nominal display
+FPS by preventing the estimated interval from replacing the internal sync
+interval.  This intentionally does not change stats-facing properties.
+---
+ video/out/vo.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/video/out/vo.c b/video/out/vo.c
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -412,6 +412,20 @@ static void check_estimated_display_fps(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+ 
++    // Short-term Windows/Vulkan display-sync workaround.
++    //
++    // Some Windows Vulkan/present paths can report a correct specified display
++    // FPS (for example exact 24000/1001), while the measured/estimated refresh
++    // converges near the rounded integer mode (24/1).  If this estimated value
++    // is accepted, display-sync can pull exact NTSC-rate video to the rounded
++    // rate and cause long-term A/V drift.
++    //
++    // For this custom build, always keep display-sync on the specified/nominal
++    // display FPS.  Do not change stats-facing estimated-display-fps; this only
++    // prevents the estimate from becoming the internal sync interval.
++    in->vsync_interval = in->nominal_vsync_interval;
++    return;
++
+     bool use_estimated = false;
+     if (in->num_total_vsync_samples >= MAX_VSYNC_SAMPLES / 2 &&
+         in->estimated_vsync_interval <= 1e9 / 20.0 &&
+-- 
+2.0.0
