@@ -428,6 +428,26 @@ jobs:
             rm -rf src_packages build${{ matrix.bit }}
             mkdir -p src_packages
           fi
+
+          # Local mpv patch refresh path.
+          # When build/source caches are restored, mpv ExternalProject may already
+          # have completed its patch/build stamps.  Remove only mpv's build prefix
+          # and reset the mpv source tree so replacing packages/mpv-*.patch actually
+          # rebuilds libmpv without rebuilding LLVM or all dependencies.
+          if compgen -G "packages/mpv-*.patch" > /dev/null; then
+            echo "=== local mpv patch detected: force mpv-only ExternalProject rebuild ==="
+            rm -rf build${{ matrix.bit }}/packages/mpv-prefix
+            if [ -d "src_packages/mpv/.git" ]; then
+              if git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}; then
+                git -C src_packages/mpv reset --hard 9bb5fe9680718d6b9f654ee8e978caf0280b9a27
+                git -C src_packages/mpv clean -fdx
+              else
+                echo "mpv source cache does not contain pinned commit; deleting src_packages/mpv for fresh clone"
+                rm -rf src_packages/mpv
+              fi
+            fi
+          fi
+
           if [[ "$(ls -A ../wrapper/patch/*.patch)" ]]; then
             for patch in ../wrapper/patch/*.patch ; do
               git am --3way "$patch" || git am --abort
