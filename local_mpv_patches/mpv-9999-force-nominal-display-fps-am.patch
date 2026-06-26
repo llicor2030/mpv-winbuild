@@ -1,42 +1,107 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 4a5a81b7a353883f899dacf13fce0df9d9ef536f Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
-Date: Thu, 25 Jun 2026 00:00:00 +0000
-Subject: [PATCH] vo: force nominal display fps for display-sync
+Date: Fri, 26 Jun 2026 02:58:18 +0000
+Subject: [PATCH] vo: keep NTSC nominal in estimated display fps
 
-Windows Vulkan/present paths can report a correct specified display FPS
-(for example exact 24000/1001) while the measured refresh converges near
-24/1.  If accepted, display-sync can pull NTSC-rate video to 24.000.
-
-For this custom build, keep display-sync on the specified/nominal display
-FPS by preventing the estimated interval from replacing the internal sync
-interval.  This intentionally does not change stats-facing properties.
 ---
- video/out/vo.c | 14 ++++++++++++++
- 1 file changed, 14 insertions(+)
+ video/out/vo.c | 57 +++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 54 insertions(+), 3 deletions(-)
 
 diff --git a/video/out/vo.c b/video/out/vo.c
+index c75edbd..d58a573 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
-@@ -412,6 +412,20 @@ static void check_estimated_display_fps(struct vo *vo)
- {
-     struct vo_internal *in = vo->in;
+@@ -402,6 +402,49 @@ static double vsync_stddef(struct vo *vo, double ref_vsync)
+     return sqrt(jitter / in->num_vsync_samples);
+ }
  
-+    // Short-term Windows/Vulkan display-sync workaround.
-+    //
-+    // Some Windows Vulkan/present paths can report a correct specified display
-+    // FPS (for example exact 24000/1001), while the measured/estimated refresh
-+    // converges near the rounded integer mode (24/1).  If this estimated value
-+    // is accepted, display-sync can pull exact NTSC-rate video to the rounded
-+    // rate and cause long-term A/V drift.
-+    //
-+    // For this custom build, always keep display-sync on the specified/nominal
-+    // display FPS.  Do not change stats-facing estimated-display-fps; this only
-+    // prevents the estimate from becoming the internal sync interval.
-+    in->vsync_interval = in->nominal_vsync_interval;
-+    return;
++static bool get_ntsc_integer_for_nominal(double nominal_fps, double *integer_fps)
++{
++    double integer = round(nominal_fps * 1001.0 / 1000.0);
 +
-     bool use_estimated = false;
-     if (in->num_total_vsync_samples >= MAX_VSYNC_SAMPLES / 2 &&
-         in->estimated_vsync_interval <= 1e9 / 20.0 &&
++    if (integer < 20 || integer > 400)
++        return false;
++
++    double ntsc = integer * 1000.0 / 1001.0;
++    if (fabs(nominal_fps - ntsc) > ntsc * 0.0005)
++        return false;
++
++    *integer_fps = integer;
++    return true;
++}
++
++static int64_t normalize_estimated_vsync_sample(struct vo *vo, int64_t sample)
++{
++    struct vo_internal *in = vo->in;
++    double nominal = in->nominal_vsync_interval;
++
++    if (nominal <= 1 || sample <= 1)
++        return sample;
++
++    double nominal_fps = 1e9 / nominal;
++    double integer_fps = 0;
++    if (!get_ntsc_integer_for_nominal(nominal_fps, &integer_fps))
++        return sample;
++
++    double sample_fps = 1e9 / sample;
++
++    // The Windows OpenGL/Vulkan presentation path can return a rounded integer
++    // period such as 24/1 even though the selected mode reported by Windows is
++    // the NTSC fractional mode 24000/1001.  The estimated clock is built from
++    // these samples before check_estimated_display_fps() compares it with the
++    // nominal clock, so keep the NTSC pair in the estimate instead of letting
++    // the integer rate win by having lower jitter.
++    if (fabs(sample_fps - integer_fps) <= integer_fps * 0.0005 &&
++        fabs(sample_fps - nominal_fps) > fabs(nominal_fps - integer_fps) * 0.25)
++        return llrint(nominal);
++
++    return sample;
++}
++
+ #define MAX_VSYNC_SAMPLES 1000
+ #define DELAY_VSYNC_SAMPLES 10
+ 
+@@ -480,15 +523,16 @@ static void update_vsync_timing_after_swap(struct vo *vo,
+ 
+     int64_t vsync_time = vsync->last_queue_display_time;
+     int64_t prev_vsync = in->prev_vsync;
+-    in->prev_vsync = vsync_time;
+ 
+     if (!in->expecting_vsync) {
++        in->prev_vsync = vsync_time;
+         reset_vsync_timings(vo);
+         return;
+     }
+ 
+     in->num_successive_vsyncs++;
+     if (in->num_successive_vsyncs <= DELAY_VSYNC_SAMPLES) {
++        in->prev_vsync = vsync_time;
+         in->base_vsync = vsync_time;
+         return;
+     }
+@@ -499,13 +543,20 @@ static void update_vsync_timing_after_swap(struct vo *vo,
+         return;
+     }
+ 
+-    if (prev_vsync <= 0)
++    if (prev_vsync <= 0) {
++        in->prev_vsync = vsync_time;
+         return;
++    }
++
++    int64_t vsync_sample = normalize_estimated_vsync_sample(vo,
++                                                            vsync_time - prev_vsync);
++    vsync_time = prev_vsync + vsync_sample;
++    in->prev_vsync = vsync_time;
+ 
+     if (in->num_vsync_samples >= MAX_VSYNC_SAMPLES)
+         in->num_vsync_samples -= 1;
+     MP_TARRAY_INSERT_AT(in, in->vsync_samples, in->num_vsync_samples, 0,
+-                        vsync_time - prev_vsync);
++                        vsync_sample);
+     in->drop_point = MPMIN(in->drop_point + 1, in->num_vsync_samples);
+     in->num_total_vsync_samples += 1;
+     if (in->base_vsync) {
 -- 
-2.0.0
+2.47.3
+
