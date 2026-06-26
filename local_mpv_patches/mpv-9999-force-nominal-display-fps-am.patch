@@ -1,14 +1,14 @@
-From 5944ff61f989857d5498f525b8b65ce5f9f271a8 Mon Sep 17 00:00:00 2001
+From 60062205bf721d4ff5dca107567437598f08330b Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
-Date: Fri, 26 Jun 2026 11:58:51 +0000
-Subject: [PATCH] vo: keep fallback timing from becoming estimated display fps
+Date: Fri, 26 Jun 2026 05:00:56 +0000
+Subject: [PATCH] vo: ignore fallback timing for estimated display sync
 
 ---
- video/out/vo.c | 24 ++++++++++++++++++------
- 1 file changed, 18 insertions(+), 6 deletions(-)
+ video/out/vo.c | 34 ++++++++++++++++++++++++++++------
+ 1 file changed, 28 insertions(+), 6 deletions(-)
 
 diff --git a/video/out/vo.c b/video/out/vo.c
-index c75edbd..4a79913 100644
+index c75edbd..acb7bd2 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -408,12 +408,13 @@ static double vsync_stddef(struct vo *vo, double ref_vsync)
@@ -37,27 +37,37 @@ index c75edbd..4a79913 100644
  {
      struct vo_internal *in = vo->in;
  
-@@ -523,9 +525,18 @@ static void update_vsync_timing_after_swap(struct vo *vo,
+@@ -523,9 +525,28 @@ static void update_vsync_timing_after_swap(struct vo *vo,
      in->estimated_vsync_jitter =
          vsync_stddef(vo, in->vsync_interval) / in->vsync_interval;
  
 -    check_estimated_display_fps(vo);
++    if (!has_vsync_feedback && in->nominal_vsync_interval > 1) {
++        // If the VO backend does not provide presentation feedback, the
++        // timestamp above is only the mp_time_ns() fallback taken after
++        // flip_page().  Treating that fallback as measured display timing can
++        // make OpenGL/Vulkan paths prefer a rounded 24.000 Hz estimate over a
++        // correct NTSC nominal value such as 24000/1001.
++        //
++        // Keep the public estimate and the internal display-sync interval on
++        // the nominal display FPS, and avoid skip/drift detection based on the
++        // fallback samples.  Backends with real feedback, such as D3D11 flip,
++        // continue to use the measured path below.
++        in->estimated_vsync_interval = in->nominal_vsync_interval;
++        in->estimated_vsync_jitter = 0;
++        in->vsync_interval = in->nominal_vsync_interval;
++        goto done;
++    }
++
 +    check_estimated_display_fps(vo, has_vsync_feedback);
      vsync_skip_detection(vo);
  
-+    if (!has_vsync_feedback && in->nominal_vsync_interval > 1) {
-+        // Without backend presentation feedback, the samples above come from
-+        // the mp_time_ns() fallback taken after flip_page().  Keep the real
-+        // display-sync mechanics intact, but do not expose that fallback
-+        // average as the measured display FPS, because it can prefer rounded
-+        // 24.000 Hz over a correct NTSC nominal value such as 24000/1001.
-+        in->estimated_vsync_interval = in->nominal_vsync_interval;
-+    }
++    done: ;
 +
      MP_STATS(vo, "value %f jitter", in->estimated_vsync_jitter);
      MP_STATS(vo, "value %f vsync-diff", MP_TIME_NS_TO_S(in->vsync_samples[0]));
  }
-@@ -1022,9 +1033,10 @@ static bool render_frame(struct vo *vo)
+@@ -1022,9 +1043,10 @@ static bool render_frame(struct vo *vo)
          };
          if (vo->driver->get_vsync)
              vo->driver->get_vsync(vo, &vsync);
@@ -69,7 +79,7 @@ index c75edbd..4a79913 100644
              vsync.last_queue_display_time = mp_time_ns();
  
          stats_time_end(in->stats, "video-flip");
-@@ -1033,7 +1045,7 @@ static bool render_frame(struct vo *vo)
+@@ -1033,7 +1055,7 @@ static bool render_frame(struct vo *vo)
          in->dropped_frame = prev_drop_count < vo->in->drop_count;
          in->rendering = false;
  
