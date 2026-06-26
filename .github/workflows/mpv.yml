@@ -485,9 +485,6 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
-          echo "=== applying 2026-06-18 dependency source-lock to package cmake files ==="
-          echo "This runs in both full and patch-only modes so CMake package definitions stay identical to the completed 6/18 cache."
-          if true; then
           # Build a 2026-06-18 source lock.  This is the stable "B" approach
           # for full rebuilds: pin every package CMake file that lacks GIT_TAG to
           # the commit that was reachable at the successful 2026-06-18 run time.
@@ -578,7 +575,13 @@ jobs:
                       nxt = lines[j]
                       if "GIT_REPOSITORY" in nxt or nxt.strip() == ")":
                           break
-                      if re.search(r"\bGIT_TAG\b", nxt):
+                      # Treat GIT_RESET (fork's working-commit pin, e.g. openssl,
+                      # curl) the same as GIT_TAG: such packages are already
+                      # pinned, and injecting a GIT_TAG would override the reset,
+                      # check out the wrong commit, and break their bundled
+                      # git-am patch (which then fails via --3way on the blobless
+                      # --filter=tree:0 clone: "could not build fake ancestor").
+                      if re.search(r"\bGIT_TAG\b", nxt) or re.search(r"\bGIT_RESET\b", nxt):
                           has_tag = True
                           break
                       j += 1
@@ -613,8 +616,6 @@ jobs:
           else:
               print("all package sources already have GIT_TAGs")
           PY
-
-          fi
 
           # Ensure mpv itself is redirected to the AnimeJaNai fork and pinned.
           sed -i 's|https://github.com/mpv-player/mpv.git|https://github.com/the-database/mpv.git|g; s|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
@@ -663,86 +664,11 @@ jobs:
           sha256sum packages/mpv-*.patch || true
           grep -h '^Subject:' packages/mpv-*.patch || true
 
-
-          echo "=== pinned-build wrapper fix: keep dependency cache stable ==="
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p = Path("../wrapper/build.sh")
-          s = p.read_text()
-          changed = []
-
-          # The 2026-06-18 wrapper runs a global update after download.
-          # For fixed GIT_TAG/source-lock caches this can touch detached dependency
-          # trees and invalidate dependency stamps. Patch-only runs must not do it.
-          s2 = re.sub(
-              r'(?m)^(\s*)ninja\s+-C\s+([^\n]+?)\s+update(?:\s*\|\|\s*true)?\s*$',
-              r'\1echo "skip global ninja update for pinned source cache"',
-              s,
-          )
-          if s2 != s:
-              changed.append("global ninja update disabled")
-          s = s2
-
-          # Patch-only mode must not make CMake throw away the restored build
-          # cache. A normal reconfigure is enough after packages/mpv.cmake changes.
-          if "${{ inputs.repro_618_deps }}" != "true" and "${{ inputs.needclean }}" != "true":
-              s2 = s.replace("cmake -Wno-dev --fresh ", "cmake -Wno-dev ")
-              if s2 != s:
-                  changed.append("cmake --fresh disabled for patch-only")
-              s = s2
-
-          if not changed:
-              print("WARNING: wrapper/build.sh was not changed")
-          else:
-              print("patched wrapper/build.sh: " + "; ".join(changed))
-          p.write_text(s)
-          PY
-
-          if [ "${{ inputs.repro_618_deps }}" != "true" ]; then
-            echo "=== patch-only cache sanity check ==="
-            if [ ! -x "clang_root/bin/clang" ]; then
-              echo "::error::clang_root/bin/clang is missing. Patch-only mode would rebuild LLVM; run full rebuild once first."
-              exit 1
-            fi
-            if [ ! -d "build${{ matrix.bit }}" ]; then
-              echo "::error::build${{ matrix.bit }} cache is missing. Patch-only mode needs a completed 6/18 build cache."
-              exit 1
-            fi
-            python3 - <<'PY'
-          from pathlib import Path
-          import subprocess, sys
-
-          expected = {
-              "ffmpeg": "f760b2fb6",
-              "libplacebo": "3be579e",
-              "libass": "35ba2ca",
-              "dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
-          }
-
-          ok = True
-          for name, want in expected.items():
-              p = Path("src_packages") / name / ".git"
-              if not p.exists():
-                  print(f"::error::{name} source cache is missing; patch-only mode must not rebuild dependencies.")
-                  ok = False
-                  continue
-              head = subprocess.check_output(["git", "-C", f"src_packages/{name}", "rev-parse", "HEAD"], text=True).strip()
-              if not head.startswith(want):
-                  print(f"::error::{name} cache mismatch: got {head}, expected {want}. Do a full 6/18 rebuild first.")
-                  ok = False
-              else:
-                  print(f"{name}: {head[:10]} OK")
-          if not ok:
-              sys.exit(1)
-          PY
-          fi
-
           echo "=== cache policy ==="
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
           echo "Full 6/18 dependency rebuild = ${{ inputs.repro_618_deps }}"
           echo "Rebuild clang_root/LLVM = ${{ inputs.rebuild_llvm }}"
-          echo "For patch-only: source-lock metadata is still applied, but dependency dirs are not cleaned."
+          echo "For exact dependency repro: repro_618_deps=true, rebuild_llvm=false unless LLVM cache is known bad."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
