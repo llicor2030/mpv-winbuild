@@ -485,8 +485,9 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
-          if [ "${{ inputs.repro_618_deps }}" = "true" ]; then
           echo "=== applying 2026-06-18 dependency source-lock to package cmake files ==="
+          echo "This runs in both full and patch-only modes so CMake package definitions stay identical to the completed 6/18 cache."
+          if true; then
           # Build a 2026-06-18 source lock.  This is the stable "B" approach
           # for full rebuilds: pin every package CMake file that lacks GIT_TAG to
           # the commit that was reachable at the successful 2026-06-18 run time.
@@ -613,8 +614,6 @@ jobs:
               print("all package sources already have GIT_TAGs")
           PY
 
-          else
-          echo "=== skipping dependency source-lock; patch-only/cache mode ==="
           fi
 
           # Ensure mpv itself is redirected to the AnimeJaNai fork and pinned.
@@ -665,28 +664,38 @@ jobs:
           grep -h '^Subject:' packages/mpv-*.patch || true
 
 
-          echo "=== pinned-build wrapper fix: disable global ninja update ==="
+          echo "=== pinned-build wrapper fix: keep dependency cache stable ==="
           python3 - <<'PY'
           from pathlib import Path
           import re
           p = Path("../wrapper/build.sh")
           s = p.read_text()
-          old = s
-          # the 2026-06-18 wrapper calls a global "ninja update" after download.
-          # That is wrong for exact GIT_TAG / source-lock caches because many
-          # ExternalProject sources are intentionally detached at fixed commits.
-          # The update target runs *-force-update and reset_head.sh, which fails
-          # with "fatal: HEAD does not point to a branch" and can also remove
-          # dependency stamp files.  Patch-only runs must not touch dependencies.
-          s = re.sub(
+          changed = []
+
+          # The 2026-06-18 wrapper runs a global update after download.
+          # For fixed GIT_TAG/source-lock caches this can touch detached dependency
+          # trees and invalidate dependency stamps. Patch-only runs must not do it.
+          s2 = re.sub(
               r'(?m)^(\s*)ninja\s+-C\s+([^\n]+?)\s+update(?:\s*\|\|\s*true)?\s*$',
               r'\1echo "skip global ninja update for pinned source cache"',
               s,
           )
-          if s == old:
-              print("WARNING: no global ninja update line was replaced in wrapper/build.sh")
+          if s2 != s:
+              changed.append("global ninja update disabled")
+          s = s2
+
+          # Patch-only mode must not make CMake throw away the restored build
+          # cache. A normal reconfigure is enough after packages/mpv.cmake changes.
+          if "${{ inputs.repro_618_deps }}" != "true" and "${{ inputs.needclean }}" != "true":
+              s2 = s.replace("cmake -Wno-dev --fresh ", "cmake -Wno-dev ")
+              if s2 != s:
+                  changed.append("cmake --fresh disabled for patch-only")
+              s = s2
+
+          if not changed:
+              print("WARNING: wrapper/build.sh was not changed")
           else:
-              print("patched wrapper/build.sh: global ninja update disabled")
+              print("patched wrapper/build.sh: " + "; ".join(changed))
           p.write_text(s)
           PY
 
@@ -733,7 +742,7 @@ jobs:
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
           echo "Full 6/18 dependency rebuild = ${{ inputs.repro_618_deps }}"
           echo "Rebuild clang_root/LLVM = ${{ inputs.rebuild_llvm }}"
-          echo "For exact dependency repro: repro_618_deps=true, rebuild_llvm=false unless LLVM cache is known bad."
+          echo "For patch-only: source-lock metadata is still applied, but dependency dirs are not cleaned."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
