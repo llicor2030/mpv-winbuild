@@ -664,6 +664,71 @@ jobs:
           sha256sum packages/mpv-*.patch || true
           grep -h '^Subject:' packages/mpv-*.patch || true
 
+
+          echo "=== pinned-build wrapper fix: disable global ninja update ==="
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("../wrapper/build.sh")
+          s = p.read_text()
+          old = s
+          # the 2026-06-18 wrapper calls a global "ninja update" after download.
+          # That is wrong for exact GIT_TAG / source-lock caches because many
+          # ExternalProject sources are intentionally detached at fixed commits.
+          # The update target runs *-force-update and reset_head.sh, which fails
+          # with "fatal: HEAD does not point to a branch" and can also remove
+          # dependency stamp files.  Patch-only runs must not touch dependencies.
+          s = re.sub(
+              r'(?m)^(\s*)ninja\s+-C\s+([^\n]+?)\s+update(?:\s*\|\|\s*true)?\s*$',
+              r'\1echo "skip global ninja update for pinned source cache"',
+              s,
+          )
+          if s == old:
+              print("WARNING: no global ninja update line was replaced in wrapper/build.sh")
+          else:
+              print("patched wrapper/build.sh: global ninja update disabled")
+          p.write_text(s)
+          PY
+
+          if [ "${{ inputs.repro_618_deps }}" != "true" ]; then
+            echo "=== patch-only cache sanity check ==="
+            if [ ! -x "clang_root/bin/clang" ]; then
+              echo "::error::clang_root/bin/clang is missing. Patch-only mode would rebuild LLVM; run full rebuild once first."
+              exit 1
+            fi
+            if [ ! -d "build${{ matrix.bit }}" ]; then
+              echo "::error::build${{ matrix.bit }} cache is missing. Patch-only mode needs a completed 6/18 build cache."
+              exit 1
+            fi
+            python3 - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+
+          expected = {
+              "ffmpeg": "f760b2fb6",
+              "libplacebo": "3be579e",
+              "libass": "35ba2ca",
+              "dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
+          }
+
+          ok = True
+          for name, want in expected.items():
+              p = Path("src_packages") / name / ".git"
+              if not p.exists():
+                  print(f"::error::{name} source cache is missing; patch-only mode must not rebuild dependencies.")
+                  ok = False
+                  continue
+              head = subprocess.check_output(["git", "-C", f"src_packages/{name}", "rev-parse", "HEAD"], text=True).strip()
+              if not head.startswith(want):
+                  print(f"::error::{name} cache mismatch: got {head}, expected {want}. Do a full 6/18 rebuild first.")
+                  ok = False
+              else:
+                  print(f"{name}: {head[:10]} OK")
+          if not ok:
+              sys.exit(1)
+          PY
+          fi
+
           echo "=== cache policy ==="
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
           echo "Full 6/18 dependency rebuild = ${{ inputs.repro_618_deps }}"
