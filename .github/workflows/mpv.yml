@@ -478,8 +478,26 @@ jobs:
           grep -n 'mpv-\*.patch' packages/mpv.cmake || true
           echo "=== local mpv patches ==="
           ls -l packages/mpv-*.patch || true
+          echo "=== mpv patch sha256 / subject ==="
+          sha256sum packages/mpv-*.patch || true
+          grep -h '^Subject:' packages/mpv-*.patch || true
+
+          echo "=== cache policy ==="
+          echo "Build without cache / needclean = ${{ inputs.needclean }}"
+          echo "Do not use needclean=true for normal mpv patch iteration; this workflow always removes only build${{ matrix.bit }}/packages/mpv-prefix so mpv is re-patched while dependency caches remain usable."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
+      - name: Dump configure logs on failure
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          echo "=== configure logs tail ==="
+          find mpv-winbuild-cmake/build${{ matrix.bit }}/packages -path '*-stamp/*configure*.log' -type f -print | while read -r f; do
+            echo
+            echo "===== $f ====="
+            tail -n 200 "$f" || true
+          done
+
       - name: Collect logs
         if: ${{ always() }}
         run: |
