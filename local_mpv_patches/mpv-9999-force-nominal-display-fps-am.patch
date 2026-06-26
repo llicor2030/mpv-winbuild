@@ -1,5 +1,5 @@
-From 3957d99d917471f7e23b47a4bf987ecd3fd810d0 Mon Sep 17 00:00:00 2001
-From: local <local@example.invalid>
+From 6cec92464e3499c6054e9c98cbc7bf5a8de70f8d Mon Sep 17 00:00:00 2001
+From: t <t@t.t>
 Date: Fri, 26 Jun 2026 06:34:59 +0000
 Subject: [PATCH] vo/vulkan/win: synthesize accurate present feedback for
  display-sync
@@ -10,25 +10,27 @@ mp_time_ns() timestamp taken right after flip_page(). On a 23.976 Hz
 estimated-display-fps logic then adopts for display-sync, pulling exact
 24000/1001 video to 24/1 and slowly desyncing audio.
 
-mpv cannot get real per-frame feedback on this path: libplacebo owns the
-swapchain (so VK_KHR_present_wait/present_id are not reachable), and
-exclusive-fullscreen direct flip bypasses the DWM compositor (so
-DwmGetCompositionTimingInfo and DXGI GetFrameStatistics are unusable).
+Note this backend has no exclusive-fullscreen mode (only the d3d11 backend
+does), so it is always DWM-composited and libplacebo (not mpv) owns the
+Vulkan swapchain; IDXGISwapChain::GetFrameStatistics is therefore not
+reachable on this path. The fix does not depend on the present path: it
+synthesizes the schedule from the exact refresh rate mpv already detects on
+Windows (VOCTRL_GET_DISPLAY_FPS, exact for NTSC modes). The real hardware
+vsync lock still comes from VK_PRESENT_MODE_FIFO_KHR; get_vsync only feeds
+vo.c the correct nominal rate.
 
-Instead, synthesize an accurate schedule from the exact refresh rate mpv
-already detects on Windows (VOCTRL_GET_DISPLAY_FPS, which is exact for NTSC
-modes). last_queue_display_time is reported on a fixed exact-period grid:
-steady playback yields exact-period deltas (no rounding drift) and gives
-display-tempo/display-resample a real, consistent timeline, while seeks,
+last_queue_display_time is reported on a fixed exact-period grid: steady
+playback yields exact-period deltas (no rounding drift) and gives
+display-tempo/display-resample a consistent timeline, while seeks,
 fast-forward, pauses and frame drops simply re-snap to the nearest grid
 point so the schedule self-corrects and never runs away. skipped_vsyncs is
 left at -1 so the skip detector cannot misfire during trick play.
 ---
  video/out/vulkan/context_win.c | 73 +++++++++++++++++++++++++++++++++-
- 1 file changed, 71 insertions(+), 2 deletions(-)
+ 1 file changed, 72 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..270a3b2 100644
+index 43bdcf2..180e8df 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,9 +15,12 @@
@@ -44,28 +46,29 @@ index 43bdcf2..270a3b2 100644
  
  #include "common.h"
  #include "context.h"
-@@ -29,6 +32,16 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+@@ -29,6 +32,18 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  struct priv {
      struct mpvk_ctx vk;
      struct mp_dxgi_factory_ctx dxgi_ctx;
 +
-+    // Synthetic presentation feedback for the Win32/Vulkan path. mpv does not
-+    // own the swapchain here (libplacebo does), and exclusive-fullscreen direct
-+    // flip bypasses the DWM compositor, so neither IDXGISwapChain
-+    // ::GetFrameStatistics nor DwmGetCompositionTimingInfo are usable. Instead
-+    // we build an accurate vsync schedule from the exact display refresh rate
-+    // that mpv already detects on Windows (DisplayConfig rational / GDI with
-+    // NTSC correction, e.g. 24000/1001). See win_vk_get_vsync().
++    // Synthetic presentation feedback for the Win32/Vulkan path. This backend
++    // has no exclusive-fullscreen mode (only the d3d11 backend does), so it is
++    // always composited by the DWM, and libplacebo (not mpv) owns the Vulkan
++    // swapchain, so IDXGISwapChain::GetFrameStatistics is unavailable. Rather
++    // than scrape a measured/derived cadence (which rounds 24000/1001 to a flat
++    // 24.000 Hz), build the schedule from the exact refresh rate mpv already
++    // detects on Windows (DisplayConfig rational, e.g. 24000/1001). The actual
++    // hardware vsync lock still comes from VK_PRESENT_MODE_FIFO_KHR; this only
++    // feeds vo.c the correct nominal rate. See win_vk_get_vsync().
 +    int64_t vsync_period;   // exact display period in ns (0 = unknown)
 +    int64_t vsync_anchor;   // fixed mp_time_ns() grid origin (0 = unset)
  };
  
  static void win_uninit(struct ra_ctx *ctx)
-@@ -63,7 +76,56 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
+@@ -63,6 +78,55 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
      return (struct pl_color_space){0};
  }
  
--static bool win_init(struct ra_ctx *ctx)
 +static void win_update_vsync_period(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
@@ -111,15 +114,14 @@ index 43bdcf2..270a3b2 100644
 +    int64_t now = mp_time_ns();
 +    if (p->vsync_anchor <= 0)
 +        p->vsync_anchor = now;
-+    int64_t k = llrint((double)(now - p->vsync_anchor) / period);
++    int64_t k = llrint((double)(now - p->vsync_anchor) / (double)period);
 +    info->last_queue_display_time = p->vsync_anchor + (k + 1) * period;
 +}
 +
-+
+ static bool win_init(struct ra_ctx *ctx)
  {
      struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
-     struct mpvk_ctx *vk = &p->vk;
-@@ -87,6 +149,7 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -87,6 +151,7 @@ static bool win_init(struct ra_ctx *ctx)
      struct ra_ctx_params params = {
          .color_depth = color_depth,
          .preferred_csp = preferred_csp,
@@ -127,7 +129,7 @@ index 43bdcf2..270a3b2 100644
      };
  
      VkInstance inst = vk->vkinst->instance;
-@@ -99,6 +162,8 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -99,6 +164,8 @@ static bool win_init(struct ra_ctx *ctx)
      if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
          goto error;
  
@@ -136,7 +138,7 @@ index 43bdcf2..270a3b2 100644
      return true;
  
  error:
-@@ -114,7 +179,9 @@ static bool resize(struct ra_ctx *ctx)
+@@ -114,7 +181,9 @@ static bool resize(struct ra_ctx *ctx)
  static bool win_reconfig(struct ra_ctx *ctx)
  {
      vo_w32_config(ctx->vo);
@@ -147,7 +149,7 @@ index 43bdcf2..270a3b2 100644
  }
  
  static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
-@@ -124,6 +191,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+@@ -124,6 +193,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
          if (!resize(ctx))
              return VO_ERROR;
      }
