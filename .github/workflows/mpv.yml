@@ -485,6 +485,8 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
+          if [ "${{ inputs.repro_618_deps }}" = "true" ]; then
+          echo "=== applying 2026-06-18 dependency source-lock to package cmake files ==="
           # Build a 2026-06-18 source lock.  This is the stable "B" approach
           # for full rebuilds: pin every package CMake file that lacks GIT_TAG to
           # the commit that was reachable at the successful 2026-06-18 run time.
@@ -610,6 +612,10 @@ jobs:
           else:
               print("all package sources already have GIT_TAGs")
           PY
+
+          else
+          echo "=== skipping dependency source-lock; patch-only/cache mode ==="
+          fi
 
           # Ensure mpv itself is redirected to the AnimeJaNai fork and pinned.
           sed -i 's|https://github.com/mpv-player/mpv.git|https://github.com/the-database/mpv.git|g; s|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
