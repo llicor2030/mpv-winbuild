@@ -43,8 +43,13 @@ on:
         required: false
         default: false
         type: boolean
-      repro_618_clean:
-        description: "Full 2026-06-18 source-lock rebuild; ignore source/build/toolchain caches"
+      repro_618_deps:
+        description: "Rebuild all dependency sources from 2026-06-18 source lock; keeps clang_root/LLVM unless rebuild_llvm is ON"
+        required: false
+        default: false
+        type: boolean
+      rebuild_llvm:
+        description: "Also rebuild clang_root/LLVM toolchain cache. Normally keep OFF."
         required: false
         default: false
         type: boolean
@@ -275,7 +280,7 @@ jobs:
 
 
       - name: Restore clang sysroot cache
-        if: ${{ inputs.compiler =='clang' && inputs.repro_618_clean != true }}
+        if: ${{ inputs.compiler == 'clang' && inputs.rebuild_llvm != true }}
         uses: actions/cache/restore@v5.0.5
         with: 
           path: ${{ github.workspace }}/mpv-winbuild-cmake/clang_root
@@ -284,7 +289,7 @@ jobs:
             ${{ matrix.bit }}-clang_root-${{ env.restore_suffix }}
 
       - name: Restore Rust Cache
-        if: ${{ inputs.repro_618_clean != true }}
+        if: ${{ inputs.needclean != true }}
         uses: actions/cache/restore@v5.0.5
         id: cache_rust
         with:
@@ -293,7 +298,7 @@ jobs:
           restore-keys: |
             rust-${{ env.restore_suffix }}
       - name: Restore Source Cache
-        if: ${{ inputs.repro_618_clean != true }}
+        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/src_packages
@@ -301,13 +306,13 @@ jobs:
           restore-keys: |
             source-${{ env.restore_suffix }}
       - name: Restore Toolchain Cache
-        if: ${{ inputs.repro_618_clean != true && env.toolchain_restore_key != '' }}
+        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && env.toolchain_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
           key: ${{ env.toolchain_restore_key }}
       - name: Restore Build Cache
-        if: ${{ inputs.repro_618_clean != true && inputs.needclean != true && env.build_restore_key != '' }}
+        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && env.build_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
@@ -413,9 +418,14 @@ jobs:
         run: |
           chmod +x wrapper/build.sh
           cd mpv-winbuild-cmake
-          if [ "${{ inputs.repro_618_clean }}" = "true" ]; then
-            echo "=== full 2026-06-18 clean rebuild requested ==="
-            rm -rf src_packages build${{ matrix.bit }} clang_root install_rustup
+          if [ "${{ inputs.rebuild_llvm }}" = "true" ]; then
+            echo "=== explicit clang_root/LLVM rebuild requested ==="
+            rm -rf clang_root
+          fi
+          if [ "${{ inputs.repro_618_deps }}" = "true" ]; then
+            echo "=== full 2026-06-18 dependency source-lock rebuild requested ==="
+            echo "Keeping clang_root/LLVM unless rebuild_llvm=true; deleting only source/build dependency state."
+            rm -rf src_packages build${{ matrix.bit }}
             mkdir -p src_packages
           fi
           if [[ "$(ls -A ../wrapper/patch/*.patch)" ]]; then
@@ -630,7 +640,9 @@ jobs:
 
           echo "=== cache policy ==="
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
-          echo "Use needclean=false for normal runs. This workflow pins selected dependency sources and removes only their ExternalProject prefixes plus mpv-prefix."
+          echo "Full 6/18 dependency rebuild = ${{ inputs.repro_618_deps }}"
+          echo "Rebuild clang_root/LLVM = ${{ inputs.rebuild_llvm }}"
+          echo "For exact dependency repro: repro_618_deps=true, rebuild_llvm=false unless LLVM cache is known bad."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
