@@ -43,6 +43,11 @@ on:
         required: false
         default: false
         type: boolean
+      repro_618_clean:
+        description: "Full 2026-06-18 source-lock rebuild; ignore source/build/toolchain caches"
+        required: false
+        default: false
+        type: boolean
       release:
         description: "Publish a release"
         required: false
@@ -270,7 +275,7 @@ jobs:
 
 
       - name: Restore clang sysroot cache
-        if: ${{ inputs.compiler =='clang' }}
+        if: ${{ inputs.compiler =='clang' && inputs.repro_618_clean != true }}
         uses: actions/cache/restore@v5.0.5
         with: 
           path: ${{ github.workspace }}/mpv-winbuild-cmake/clang_root
@@ -279,6 +284,7 @@ jobs:
             ${{ matrix.bit }}-clang_root-${{ env.restore_suffix }}
 
       - name: Restore Rust Cache
+        if: ${{ inputs.repro_618_clean != true }}
         uses: actions/cache/restore@v5.0.5
         id: cache_rust
         with:
@@ -287,6 +293,7 @@ jobs:
           restore-keys: |
             rust-${{ env.restore_suffix }}
       - name: Restore Source Cache
+        if: ${{ inputs.repro_618_clean != true }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/src_packages
@@ -294,13 +301,13 @@ jobs:
           restore-keys: |
             source-${{ env.restore_suffix }}
       - name: Restore Toolchain Cache
-        if: ${{ env.toolchain_restore_key != '' }}
+        if: ${{ inputs.repro_618_clean != true && env.toolchain_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
           key: ${{ env.toolchain_restore_key }}
       - name: Restore Build Cache
-        if: ${{ inputs.needclean != true && env.build_restore_key != '' }}
+        if: ${{ inputs.repro_618_clean != true && inputs.needclean != true && env.build_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
@@ -406,6 +413,11 @@ jobs:
         run: |
           chmod +x wrapper/build.sh
           cd mpv-winbuild-cmake
+          if [ "${{ inputs.repro_618_clean }}" = "true" ]; then
+            echo "=== full 2026-06-18 clean rebuild requested ==="
+            rm -rf src_packages build${{ matrix.bit }} clang_root install_rustup
+            mkdir -p src_packages
+          fi
           if [[ "$(ls -A ../wrapper/patch/*.patch)" ]]; then
             for patch in ../wrapper/patch/*.patch ; do
               git am --3way "$patch" || git am --abort
@@ -443,92 +455,152 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
-          # Pin the critical dependency source packages used by the 2026-06-18
-          # working AnimeJaNai build.  This is the stable "A" approach:
-          # patch the package definitions and reset only selected source repos.
-          # Do not reset all src_packages blindly.
+          # Build a 2026-06-18 source lock.  This is the stable "B" approach
+          # for full rebuilds: pin every package CMake file that lacks GIT_TAG to
+          # the commit that was reachable at the successful 2026-06-18 run time.
+          # Known heavy/verified commits are hardcoded to avoid expensive history scans.
           python3 - <<'PY'
           from pathlib import Path
-          pins = {
-              "packages/ffmpeg.cmake": ("GIT_REPOSITORY", "FFmpeg/FFmpeg", "f760b2fb6"),
-              "packages/libplacebo.cmake": ("GIT_REPOSITORY", "haasn/libplacebo", "3be579e"),
-              "packages/libass.cmake": ("GIT_REPOSITORY", "libass/libass", "35ba2ca"),
-              # dav1d was not printed in the official artifact name.  Pin it to
-              # the 2026-06-17 master head visible in the GitHub mirror.
-              "packages/dav1d.cmake": ("GIT_REPOSITORY", "videolan/dav1d", "14c73c7"),
+          import re
+          import subprocess
+          import tempfile
+          import shutil
+
+          CUTOFF = "2026-06-18T00:40:00Z"
+
+          # Commits verified from the 6/18 success log / previous comparison notes.
+          # Short SHAs are okay for Git, but full SHAs are preferred when known.
+          KNOWN_BY_REPO_PART = {
+              "the-database/mpv": "9bb5fe9680718d6b9f654ee8e978caf0280b9a27",
+              "FFmpeg/FFmpeg": "f760b2fb6",
+              "haasn/libplacebo": "3be579e",
+              "libass/libass": "35ba2ca",
+              "llvm/llvm-project": "1f5aee5",
+              "mingw-w64": "0034988",
+              "zlib-ng/zlib-ng": "5d005c5",
           }
-          for fn, (key, repo, tag) in pins.items():
-              path = Path(fn)
+
+          cache = {}
+
+          def run(args, cwd=None, check=True):
+              print("+", " ".join(args))
+              return subprocess.run(args, cwd=cwd, check=check, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
+
+          def known_commit(url):
+              for key, val in KNOWN_BY_REPO_PART.items():
+                  if key.lower() in url.lower():
+                      return val
+              return None
+
+          def default_branch(url):
+              out = run(["git", "ls-remote", "--symref", url, "HEAD"], check=False)
+              m = re.search(r"ref: refs/heads/([^\t ]+)\s+HEAD", out)
+              if m:
+                  return m.group(1)
+              for b in ("master", "main"):
+                  out2 = run(["git", "ls-remote", "--heads", url, b], check=False)
+                  if out2.strip():
+                      return b
+              raise SystemExit(f"could not determine default branch for {url}")
+
+          def commit_at_date(url):
+              if url in cache:
+                  return cache[url]
+              k = known_commit(url)
+              if k:
+                  cache[url] = k
+                  return k
+              branch = default_branch(url)
+              tmp = Path(tempfile.mkdtemp(prefix="pinrepo_"))
+              try:
+                  # Full commit history, filtered blobs. Needed for --before.
+                  run(["git", "clone", "--bare", "--filter=blob:none", "--branch", branch, url, str(tmp / "repo.git")])
+                  sha = run(["git", "rev-list", "-n", "1", f"--before={CUTOFF}", f"refs/heads/{branch}"], cwd=tmp / "repo.git").strip()
+                  if not sha:
+                      raise SystemExit(f"no commit before {CUTOFF} for {url} {branch}")
+                  cache[url] = sha
+                  return sha
+              finally:
+                  shutil.rmtree(tmp, ignore_errors=True)
+
+          def patch_file(path: Path):
               text = path.read_text()
-              if f"GIT_TAG {tag}" in text:
-                  continue
               lines = text.splitlines()
               out = []
-              inserted = False
-              for line in lines:
+              changed = False
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
                   out.append(line)
-                  if (not inserted) and key in line and repo in line:
-                      out.append(f"    GIT_TAG {tag}")
-                      inserted = True
-              if not inserted:
-                  raise SystemExit(f"failed to insert GIT_TAG {tag} into {fn}")
-              path.write_text("\n".join(out) + "\n")
+                  m = re.search(r"GIT_REPOSITORY\s+([^\s)]+)", line)
+                  if not m:
+                      i += 1
+                      continue
+                  url = m.group(1).strip().strip('"')
+                  # Look ahead within the current ExternalProject block.
+                  j = i + 1
+                  has_tag = False
+                  while j < len(lines):
+                      nxt = lines[j]
+                      if "GIT_REPOSITORY" in nxt or nxt.strip() == ")":
+                          break
+                      if re.search(r"\bGIT_TAG\b", nxt):
+                          has_tag = True
+                          break
+                      j += 1
+                  if not has_tag:
+                      if not (url.startswith("http://") or url.startswith("https://") or url.startswith("git://")):
+                          raise SystemExit(f"unsupported GIT_REPOSITORY URL in {path}: {url}")
+                      sha = commit_at_date(url)
+                      indent = re.match(r"^(\s*)", line).group(1)
+                      out.append(f"{indent}GIT_TAG {sha}")
+                      print(f"PIN {path}: {url} -> {sha}")
+                      changed = True
+                  i += 1
+              if changed:
+                  path.write_text("\n".join(out) + "\n")
+              return changed
+
+          changed_files = []
+          for path in sorted(Path("packages").glob("*.cmake")):
+              if "GIT_REPOSITORY" not in path.read_text(errors="ignore"):
+                  continue
+              if patch_file(path):
+                  changed_files.append(str(path))
+
+          print("=== source lock summary ===")
+          for url, sha in sorted(cache.items()):
+              print(f"{sha}  {url}")
+          Path("../source-lock-2026-06-18.txt").write_text("\n".join(f"{sha}  {url}" for url, sha in sorted(cache.items())) + "\n")
+
+          if changed_files:
+              run(["git", "add", *changed_files])
+              run(["git", "-c", "user.name=ci", "-c", "user.email=ci@local", "commit", "-m", "lock source packages to 2026-06-18"])
+          else:
+              print("all package sources already have GIT_TAGs")
           PY
 
-          if ! git diff --quiet -- packages/mpv.cmake packages/ffmpeg.cmake packages/libplacebo.cmake packages/libass.cmake packages/dav1d.cmake; then
-            git add packages/mpv.cmake packages/ffmpeg.cmake packages/libplacebo.cmake packages/libass.cmake packages/dav1d.cmake
-            git -c user.name=ci -c user.email=ci@local commit -m "pin 2026-06-18 mpv and dependency sources"
-          else
-            echo "mpv/dependency package cmake files already pinned"
+          # Ensure mpv itself is redirected to the AnimeJaNai fork and pinned.
+          sed -i 's|https://github.com/mpv-player/mpv.git|https://github.com/the-database/mpv.git|g; s|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('packages/mpv.cmake')
+          text = p.read_text()
+          wanted = 'GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27'
+          if wanted not in text:
+              lines = text.splitlines()
+              out=[]
+              for line in lines:
+                  out.append(line)
+                  if 'GIT_REPOSITORY' in line and 'the-database/mpv.git' in line:
+                      out.append('    ' + wanted)
+              p.write_text('\n'.join(out)+'\n')
+          PY
+          if ! git diff --quiet -- packages/mpv.cmake; then
+            git add packages/mpv.cmake
+            git -c user.name=ci -c user.email=ci@local commit -m "redirect and pin mpv source"
           fi
-
-          pin_repo() {
-            local name="$1"
-            local remote="$2"
-            local ref="$3"
-            local branch="${4:-master}"
-            local dir="src_packages/${name}"
-
-            echo "=== pin source ${name} -> ${ref} ==="
-            if [ ! -d "${dir}/.git" ]; then
-              echo "${dir} not present yet; ExternalProject will clone with GIT_TAG ${ref}"
-              return 0
-            fi
-
-            git -C "${dir}" remote set-url origin "${remote}" || true
-
-            if [ "$(git -C "${dir}" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
-              git -C "${dir}" fetch --unshallow --force --tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
-            else
-              git -C "${dir}" fetch --force --tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
-            fi
-
-            if ! git -C "${dir}" cat-file -e "${ref}^{commit}" 2>/dev/null; then
-              git -C "${dir}" fetch --force origin "${ref}" || true
-            fi
-            git -C "${dir}" cat-file -e "${ref}^{commit}"
-            git -C "${dir}" reset --hard "${ref}"
-            git -C "${dir}" clean -fdx
-            git -C "${dir}" rev-parse --short HEAD
-          }
-
-          pin_repo "mpv" "https://github.com/the-database/mpv.git" "9bb5fe9680718d6b9f654ee8e978caf0280b9a27" "master"
-          pin_repo "ffmpeg" "https://github.com/FFmpeg/FFmpeg.git" "f760b2fb6" "master"
-          pin_repo "libplacebo" "https://github.com/haasn/libplacebo.git" "3be579e" "master"
-          pin_repo "libass" "https://github.com/libass/libass.git" "35ba2ca" "master"
-          pin_repo "dav1d" "https://code.videolan.org/videolan/dav1d.git" "14c73c7" "master"
-
-          # Force only the changed dependency ExternalProjects and mpv to rerun.
-          # Keep the rest of build/cache intact to avoid the zlib/brotli/libiconv
-          # fresh-configure failure seen with needclean=true.
-          for p in dav1d libass libplacebo ffmpeg mpv; do
-            rm -rf "build${{ matrix.bit }}/packages/${p}-prefix" || true
-          done
-          rm -rf build${{ matrix.bit }}/mpv* || true
-          rm -f build${{ matrix.bit }}/install/*/lib/libav*.a || true
-          rm -rf build${{ matrix.bit }}/install/*/include/libav* || true
-          rm -f build${{ matrix.bit }}/install/*/lib/libplacebo* build${{ matrix.bit }}/install/*/lib/libass* build${{ matrix.bit }}/install/*/lib/libdav1d* || true
-          rm -rf build${{ matrix.bit }}/install/*/include/libplacebo build${{ matrix.bit }}/install/*/include/ass build${{ matrix.bit }}/install/*/include/dav1d || true
 
           echo "=== effective mpv.cmake: mpv source ==="
           grep -n -A12 -B4 'GIT_REPOSITORY .*mpv' packages/mpv.cmake || true
@@ -561,6 +633,13 @@ jobs:
           echo "Use needclean=false for normal runs. This workflow pins selected dependency sources and removes only their ExternalProject prefixes plus mpv-prefix."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
+      - name: Upload source lock manifest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-lock-2026-06-18-${{ matrix.bit }}${{ matrix.lgpl == true && '-lgpl' || '' }}
+          path: source-lock-2026-06-18.txt
+          if-no-files-found: ignore
       - name: Dump configure logs on failure
         if: ${{ failure() }}
         shell: bash
