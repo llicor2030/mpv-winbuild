@@ -443,39 +443,113 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
-          if ! git diff --quiet -- packages/mpv.cmake; then
-            git add packages/mpv.cmake
-            git -c user.name=ci -c user.email=ci@local commit -m "redirect and pin mpv source"
+          # Pin the critical dependency source packages used by the 2026-06-18
+          # working AnimeJaNai build.  This is the stable "A" approach:
+          # patch the package definitions and reset only selected source repos.
+          # Do not reset all src_packages blindly.
+          python3 - <<'PY'
+          from pathlib import Path
+          pins = {
+              "packages/ffmpeg.cmake": ("GIT_REPOSITORY", "FFmpeg/FFmpeg", "f760b2fb6"),
+              "packages/libplacebo.cmake": ("GIT_REPOSITORY", "haasn/libplacebo", "3be579e"),
+              "packages/libass.cmake": ("GIT_REPOSITORY", "libass/libass", "35ba2ca"),
+              # dav1d was not printed in the official artifact name.  Pin it to
+              # the 2026-06-17 master head visible in the GitHub mirror.
+              "packages/dav1d.cmake": ("GIT_REPOSITORY", "videolan/dav1d", "14c73c7"),
+          }
+          for fn, (key, repo, tag) in pins.items():
+              path = Path(fn)
+              text = path.read_text()
+              if f"GIT_TAG {tag}" in text:
+                  continue
+              lines = text.splitlines()
+              out = []
+              inserted = False
+              for line in lines:
+                  out.append(line)
+                  if (not inserted) and key in line and repo in line:
+                      out.append(f"    GIT_TAG {tag}")
+                      inserted = True
+              if not inserted:
+                  raise SystemExit(f"failed to insert GIT_TAG {tag} into {fn}")
+              path.write_text("\n".join(out) + "\n")
+          PY
+
+          if ! git diff --quiet -- packages/mpv.cmake packages/ffmpeg.cmake packages/libplacebo.cmake packages/libass.cmake packages/dav1d.cmake; then
+            git add packages/mpv.cmake packages/ffmpeg.cmake packages/libplacebo.cmake packages/libass.cmake packages/dav1d.cmake
+            git -c user.name=ci -c user.email=ci@local commit -m "pin 2026-06-18 mpv and dependency sources"
           else
-            echo "packages/mpv.cmake already redirected and pinned"
+            echo "mpv/dependency package cmake files already pinned"
           fi
 
-          # If a source cache restored a newer mpv checkout, force only mpv back
-          # to the known working commit. Do not reset every dependency here.
-          if [ -d src_packages/mpv/.git ]; then
-            git -C src_packages/mpv remote set-url origin https://github.com/the-database/mpv.git || true
-            if [ "$(git -C src_packages/mpv rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
-              git -C src_packages/mpv fetch --unshallow --force --tags origin +refs/heads/master:refs/remotes/origin/master || true
+          pin_repo() {
+            local name="$1"
+            local remote="$2"
+            local ref="$3"
+            local branch="${4:-master}"
+            local dir="src_packages/${name}"
+
+            echo "=== pin source ${name} -> ${ref} ==="
+            if [ ! -d "${dir}/.git" ]; then
+              echo "${dir} not present yet; ExternalProject will clone with GIT_TAG ${ref}"
+              return 0
+            fi
+
+            git -C "${dir}" remote set-url origin "${remote}" || true
+
+            if [ "$(git -C "${dir}" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+              git -C "${dir}" fetch --unshallow --force --tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
             else
-              git -C src_packages/mpv fetch --force --tags origin +refs/heads/master:refs/remotes/origin/master || true
+              git -C "${dir}" fetch --force --tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
             fi
-            if ! git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}; then
-              git -C src_packages/mpv fetch --force origin 9bb5fe9680718d6b9f654ee8e978caf0280b9a27 || true
-            fi
-            git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}
-            git -C src_packages/mpv reset --hard 9bb5fe9680718d6b9f654ee8e978caf0280b9a27
-            git -C src_packages/mpv clean -fdx
-          fi
 
-          # Force mpv ExternalProject to re-run download/patch/configure if a
-          # build cache restored stale stamps from a newer build.
-          rm -rf build${{ matrix.bit }}/packages/mpv-prefix || true
+            if ! git -C "${dir}" cat-file -e "${ref}^{commit}" 2>/dev/null; then
+              git -C "${dir}" fetch --force origin "${ref}" || true
+            fi
+            git -C "${dir}" cat-file -e "${ref}^{commit}"
+            git -C "${dir}" reset --hard "${ref}"
+            git -C "${dir}" clean -fdx
+            git -C "${dir}" rev-parse --short HEAD
+          }
+
+          pin_repo "mpv" "https://github.com/the-database/mpv.git" "9bb5fe9680718d6b9f654ee8e978caf0280b9a27" "master"
+          pin_repo "ffmpeg" "https://github.com/FFmpeg/FFmpeg.git" "f760b2fb6" "master"
+          pin_repo "libplacebo" "https://github.com/haasn/libplacebo.git" "3be579e" "master"
+          pin_repo "libass" "https://github.com/libass/libass.git" "35ba2ca" "master"
+          pin_repo "dav1d" "https://code.videolan.org/videolan/dav1d.git" "14c73c7" "master"
+
+          # Force only the changed dependency ExternalProjects and mpv to rerun.
+          # Keep the rest of build/cache intact to avoid the zlib/brotli/libiconv
+          # fresh-configure failure seen with needclean=true.
+          for p in dav1d libass libplacebo ffmpeg mpv; do
+            rm -rf "build${{ matrix.bit }}/packages/${p}-prefix" || true
+          done
+          rm -rf build${{ matrix.bit }}/mpv* || true
+          rm -f build${{ matrix.bit }}/install/*/lib/libav*.a || true
+          rm -rf build${{ matrix.bit }}/install/*/include/libav* || true
+          rm -f build${{ matrix.bit }}/install/*/lib/libplacebo* build${{ matrix.bit }}/install/*/lib/libass* build${{ matrix.bit }}/install/*/lib/libdav1d* || true
+          rm -rf build${{ matrix.bit }}/install/*/include/libplacebo build${{ matrix.bit }}/install/*/include/ass build${{ matrix.bit }}/install/*/include/dav1d || true
 
           echo "=== effective mpv.cmake: mpv source ==="
           grep -n -A12 -B4 'GIT_REPOSITORY .*mpv' packages/mpv.cmake || true
+          echo "=== effective dependency GIT_TAGs ==="
+          for f in packages/ffmpeg.cmake packages/libplacebo.cmake packages/libass.cmake packages/dav1d.cmake; do
+            echo "--- $f ---"
+            grep -n -A3 -B2 'GIT_REPOSITORY' "$f" || true
+            grep -n 'GIT_TAG' "$f" || true
+          done
           echo "=== effective mpv.cmake: PATCH_COMMAND ==="
           grep -n 'PATCH_COMMAND' packages/mpv.cmake || true
           grep -n 'mpv-\*.patch' packages/mpv.cmake || true
+          echo "=== selected source heads before build ==="
+          for p in mpv ffmpeg libplacebo libass dav1d; do
+            if [ -d "src_packages/${p}/.git" ]; then
+              printf '%-12s ' "$p"
+              git -C "src_packages/${p}" rev-parse --short HEAD || true
+            else
+              echo "$p not cloned yet"
+            fi
+          done
           echo "=== local mpv patches ==="
           ls -l packages/mpv-*.patch || true
           echo "=== mpv patch sha256 / subject ==="
@@ -484,7 +558,7 @@ jobs:
 
           echo "=== cache policy ==="
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
-          echo "Do not use needclean=true for normal mpv patch iteration; this workflow always removes only build${{ matrix.bit }}/packages/mpv-prefix so mpv is re-patched while dependency caches remain usable."
+          echo "Use needclean=false for normal runs. This workflow pins selected dependency sources and removes only their ExternalProject prefixes plus mpv-prefix."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Dump configure logs on failure
