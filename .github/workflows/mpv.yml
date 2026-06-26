@@ -428,26 +428,6 @@ jobs:
             rm -rf src_packages build${{ matrix.bit }}
             mkdir -p src_packages
           fi
-
-          # Local mpv patch refresh path.
-          # When build/source caches are restored, mpv ExternalProject may already
-          # have completed its patch/build stamps.  Remove only mpv's build prefix
-          # and reset the mpv source tree so replacing packages/mpv-*.patch actually
-          # rebuilds libmpv without rebuilding LLVM or all dependencies.
-          if compgen -G "packages/mpv-*.patch" > /dev/null; then
-            echo "=== local mpv patch detected: force mpv-only ExternalProject rebuild ==="
-            rm -rf build${{ matrix.bit }}/packages/mpv-prefix
-            if [ -d "src_packages/mpv/.git" ]; then
-              if git -C src_packages/mpv cat-file -e 9bb5fe9680718d6b9f654ee8e978caf0280b9a27^{commit}; then
-                git -C src_packages/mpv reset --hard 9bb5fe9680718d6b9f654ee8e978caf0280b9a27
-                git -C src_packages/mpv clean -fdx
-              else
-                echo "mpv source cache does not contain pinned commit; deleting src_packages/mpv for fresh clone"
-                rm -rf src_packages/mpv
-              fi
-            fi
-          fi
-
           if [[ "$(ls -A ../wrapper/patch/*.patch)" ]]; then
             for patch in ../wrapper/patch/*.patch ; do
               git am --3way "$patch" || git am --abort
@@ -485,6 +465,8 @@ jobs:
             sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
+          if [ "${{ inputs.repro_618_deps }}" = "true" ]; then
+          echo "=== applying 2026-06-18 dependency source-lock to package cmake files ==="
           # Build a 2026-06-18 source lock.  This is the stable "B" approach
           # for full rebuilds: pin every package CMake file that lacks GIT_TAG to
           # the commit that was reachable at the successful 2026-06-18 run time.
@@ -575,13 +557,7 @@ jobs:
                       nxt = lines[j]
                       if "GIT_REPOSITORY" in nxt or nxt.strip() == ")":
                           break
-                      # Treat GIT_RESET (fork's working-commit pin, e.g. openssl,
-                      # curl) the same as GIT_TAG: such packages are already
-                      # pinned, and injecting a GIT_TAG would override the reset,
-                      # check out the wrong commit, and break their bundled
-                      # git-am patch (which then fails via --3way on the blobless
-                      # --filter=tree:0 clone: "could not build fake ancestor").
-                      if re.search(r"\bGIT_TAG\b", nxt) or re.search(r"\bGIT_RESET\b", nxt):
+                      if re.search(r"\bGIT_TAG\b", nxt):
                           has_tag = True
                           break
                       j += 1
@@ -616,6 +592,11 @@ jobs:
           else:
               print("all package sources already have GIT_TAGs")
           PY
+
+          else
+          echo "=== skipping dependency source-lock; original cache/mpv-patch flow ==="
+          echo "This mode keeps the completed build/source caches and only forces mpv-prefix to rebuild."
+          fi
 
           # Ensure mpv itself is redirected to the AnimeJaNai fork and pinned.
           sed -i 's|https://github.com/mpv-player/mpv.git|https://github.com/the-database/mpv.git|g; s|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
@@ -668,7 +649,7 @@ jobs:
           echo "Build without cache / needclean = ${{ inputs.needclean }}"
           echo "Full 6/18 dependency rebuild = ${{ inputs.repro_618_deps }}"
           echo "Rebuild clang_root/LLVM = ${{ inputs.rebuild_llvm }}"
-          echo "For exact dependency repro: repro_618_deps=true, rebuild_llvm=false unless LLVM cache is known bad."
+          echo "Mode: repro_618_deps=true for full source-lock rebuild; false for original mpv patch-only cache flow."
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
