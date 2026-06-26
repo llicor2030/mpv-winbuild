@@ -1,93 +1,161 @@
-From 60062205bf721d4ff5dca107567437598f08330b Mon Sep 17 00:00:00 2001
+From 3957d99d917471f7e23b47a4bf987ecd3fd810d0 Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
-Date: Fri, 26 Jun 2026 05:00:56 +0000
-Subject: [PATCH] vo: ignore fallback timing for estimated display sync
+Date: Fri, 26 Jun 2026 06:34:59 +0000
+Subject: [PATCH] vo/vulkan/win: synthesize accurate present feedback for
+ display-sync
 
+The Win32/Vulkan context provided no get_vsync, so vo.c fell back to the
+mp_time_ns() timestamp taken right after flip_page(). On a 23.976 Hz
+(24000/1001) display that measured cadence rounds to 24.000 Hz, which the
+estimated-display-fps logic then adopts for display-sync, pulling exact
+24000/1001 video to 24/1 and slowly desyncing audio.
+
+mpv cannot get real per-frame feedback on this path: libplacebo owns the
+swapchain (so VK_KHR_present_wait/present_id are not reachable), and
+exclusive-fullscreen direct flip bypasses the DWM compositor (so
+DwmGetCompositionTimingInfo and DXGI GetFrameStatistics are unusable).
+
+Instead, synthesize an accurate schedule from the exact refresh rate mpv
+already detects on Windows (VOCTRL_GET_DISPLAY_FPS, which is exact for NTSC
+modes). last_queue_display_time is reported on a fixed exact-period grid:
+steady playback yields exact-period deltas (no rounding drift) and gives
+display-tempo/display-resample a real, consistent timeline, while seeks,
+fast-forward, pauses and frame drops simply re-snap to the nearest grid
+point so the schedule self-corrects and never runs away. skipped_vsyncs is
+left at -1 so the skip detector cannot misfire during trick play.
 ---
- video/out/vo.c | 34 ++++++++++++++++++++++++++++------
- 1 file changed, 28 insertions(+), 6 deletions(-)
+ video/out/vulkan/context_win.c | 73 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 71 insertions(+), 2 deletions(-)
 
-diff --git a/video/out/vo.c b/video/out/vo.c
-index c75edbd..acb7bd2 100644
---- a/video/out/vo.c
-+++ b/video/out/vo.c
-@@ -408,12 +408,13 @@ static double vsync_stddef(struct vo *vo, double ref_vsync)
- // Check if we should switch to measured average display FPS if it seems
- // "better" then the system-reported one. (Note that small differences are
- // handled as drift instead.)
--static void check_estimated_display_fps(struct vo *vo)
-+static void check_estimated_display_fps(struct vo *vo, bool has_vsync_feedback)
- {
-     struct vo_internal *in = vo->in;
+diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
+index 43bdcf2..270a3b2 100644
+--- a/video/out/vulkan/context_win.c
++++ b/video/out/vulkan/context_win.c
+@@ -15,9 +15,12 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
  
-     bool use_estimated = false;
--    if (in->num_total_vsync_samples >= MAX_VSYNC_SAMPLES / 2 &&
-+    if (has_vsync_feedback &&
-+        in->num_total_vsync_samples >= MAX_VSYNC_SAMPLES / 2 &&
-         in->estimated_vsync_interval <= 1e9 / 20.0 &&
-         in->estimated_vsync_interval >= 1e9 / 400.0)
-     {
-@@ -474,7 +475,8 @@ static void vsync_skip_detection(struct vo *vo)
- 
- // Always called locked.
- static void update_vsync_timing_after_swap(struct vo *vo,
--                                           struct vo_vsync_info *vsync)
-+                                           struct vo_vsync_info *vsync,
-+                                           bool has_vsync_feedback)
- {
-     struct vo_internal *in = vo->in;
- 
-@@ -523,9 +525,28 @@ static void update_vsync_timing_after_swap(struct vo *vo,
-     in->estimated_vsync_jitter =
-         vsync_stddef(vo, in->vsync_interval) / in->vsync_interval;
- 
--    check_estimated_display_fps(vo);
-+    if (!has_vsync_feedback && in->nominal_vsync_interval > 1) {
-+        // If the VO backend does not provide presentation feedback, the
-+        // timestamp above is only the mp_time_ns() fallback taken after
-+        // flip_page().  Treating that fallback as measured display timing can
-+        // make OpenGL/Vulkan paths prefer a rounded 24.000 Hz estimate over a
-+        // correct NTSC nominal value such as 24000/1001.
-+        //
-+        // Keep the public estimate and the internal display-sync interval on
-+        // the nominal display FPS, and avoid skip/drift detection based on the
-+        // fallback samples.  Backends with real feedback, such as D3D11 flip,
-+        // continue to use the measured path below.
-+        in->estimated_vsync_interval = in->nominal_vsync_interval;
-+        in->estimated_vsync_jitter = 0;
-+        in->vsync_interval = in->nominal_vsync_interval;
-+        goto done;
-+    }
++#include <math.h>
 +
-+    check_estimated_display_fps(vo, has_vsync_feedback);
-     vsync_skip_detection(vo);
+ #include "video/out/gpu/context.h"
+ #include "video/out/gpu/d3d11_helpers.h"
+ #include "video/out/w32_common.h"
++#include "osdep/timer.h"
  
-+    done: ;
+ #include "common.h"
+ #include "context.h"
+@@ -29,6 +32,16 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+ struct priv {
+     struct mpvk_ctx vk;
+     struct mp_dxgi_factory_ctx dxgi_ctx;
 +
-     MP_STATS(vo, "value %f jitter", in->estimated_vsync_jitter);
-     MP_STATS(vo, "value %f vsync-diff", MP_TIME_NS_TO_S(in->vsync_samples[0]));
++    // Synthetic presentation feedback for the Win32/Vulkan path. mpv does not
++    // own the swapchain here (libplacebo does), and exclusive-fullscreen direct
++    // flip bypasses the DWM compositor, so neither IDXGISwapChain
++    // ::GetFrameStatistics nor DwmGetCompositionTimingInfo are usable. Instead
++    // we build an accurate vsync schedule from the exact display refresh rate
++    // that mpv already detects on Windows (DisplayConfig rational / GDI with
++    // NTSC correction, e.g. 24000/1001). See win_vk_get_vsync().
++    int64_t vsync_period;   // exact display period in ns (0 = unknown)
++    int64_t vsync_anchor;   // fixed mp_time_ns() grid origin (0 = unset)
+ };
+ 
+ static void win_uninit(struct ra_ctx *ctx)
+@@ -63,7 +76,56 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
+     return (struct pl_color_space){0};
  }
-@@ -1022,9 +1043,10 @@ static bool render_frame(struct vo *vo)
-         };
-         if (vo->driver->get_vsync)
-             vo->driver->get_vsync(vo, &vsync);
-+        bool has_vsync_feedback = vsync.last_queue_display_time > 0;
  
-         // Make up some crap if presentation feedback is missing.
--        if (vsync.last_queue_display_time <= 0)
-+        if (!has_vsync_feedback)
-             vsync.last_queue_display_time = mp_time_ns();
+-static bool win_init(struct ra_ctx *ctx)
++static void win_update_vsync_period(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++
++    // Use mpv's accurate Windows refresh-rate detection. This is exact for
++    // NTSC modes (e.g. 23.976 Hz -> period ~41708 us), unlike the measured
++    // swap cadence which rounds to 24.000 Hz and makes display-sync drift.
++    int events = 0;
++    double fps = 0;
++    if (vo_w32_control(ctx->vo, &events, VOCTRL_GET_DISPLAY_FPS, &fps) != VO_TRUE)
++        fps = 0;
++
++    int64_t period = fps > 1.0 ? llrint(1e9 / fps) : 0;
++    if (period != p->vsync_period) {
++        p->vsync_period = period;
++        p->vsync_anchor = 0;   // re-anchor the grid when the rate changes
++    }
++}
++
++static void win_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    struct priv *p = ctx->priv;
++
++    int64_t period = p->vsync_period;
++    if (period <= 0)
++        return;   // leave info unset: vo.c falls back to its own timing
++
++    // Report the true physical refresh interval so display-sync uses the
++    // correct nominal rate instead of a rounded estimate.
++    info->vsync_duration = period;
++
++    // We have no per-frame skip information; never claim any, so the skip
++    // detector cannot misfire (important for seeking / fast-forward).
++    info->skipped_vsyncs = -1;
++
++    // Phase-locked grid. Snap "now" onto a fixed grid of exact-period points
++    // and report the next grid point as the predicted display time.
++    //   - During steady playback consecutive samples differ by exactly one
++    //     period, which kills the 24.000 Hz rounding drift.
++    //   - After a seek, fast-forward, pause or frame drop, "now" jumps and we
++    //     simply re-snap to the nearest grid point, so the schedule
++    //     self-corrects on the very next frame and never runs away.
++    int64_t now = mp_time_ns();
++    if (p->vsync_anchor <= 0)
++        p->vsync_anchor = now;
++    int64_t k = llrint((double)(now - p->vsync_anchor) / period);
++    info->last_queue_display_time = p->vsync_anchor + (k + 1) * period;
++}
++
++
+ {
+     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+     struct mpvk_ctx *vk = &p->vk;
+@@ -87,6 +149,7 @@ static bool win_init(struct ra_ctx *ctx)
+     struct ra_ctx_params params = {
+         .color_depth = color_depth,
+         .preferred_csp = preferred_csp,
++        .get_vsync = win_vk_get_vsync,
+     };
  
-         stats_time_end(in->stats, "video-flip");
-@@ -1033,7 +1055,7 @@ static bool render_frame(struct vo *vo)
-         in->dropped_frame = prev_drop_count < vo->in->drop_count;
-         in->rendering = false;
+     VkInstance inst = vk->vkinst->instance;
+@@ -99,6 +162,8 @@ static bool win_init(struct ra_ctx *ctx)
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto error;
  
--        update_vsync_timing_after_swap(vo, &vsync);
-+        update_vsync_timing_after_swap(vo, &vsync, has_vsync_feedback);
++    win_update_vsync_period(ctx);
++
+     return true;
+ 
+ error:
+@@ -114,7 +179,9 @@ static bool resize(struct ra_ctx *ctx)
+ static bool win_reconfig(struct ra_ctx *ctx)
+ {
+     vo_w32_config(ctx->vo);
+-    return resize(ctx);
++    bool ok = resize(ctx);
++    win_update_vsync_period(ctx);
++    return ok;
+ }
+ 
+ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+@@ -124,6 +191,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+         if (!resize(ctx))
+             return VO_ERROR;
      }
++    if (*events & (VO_EVENT_RESIZE | VO_EVENT_WIN_STATE))
++        win_update_vsync_period(ctx);
+     return ret;
+ }
  
-     if (vo->driver->caps & VO_CAP_NORETAIN) {
 -- 
-2.47.3
+2.43.0
 
