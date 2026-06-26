@@ -197,7 +197,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: the-database/mpv-winbuild
-          ref: 8c5353dc3fa0b0522af309b4793c9f62369e3422
+          ref: b7423e62eab1f33adbd068e6abb9d00b833702bd
           path: wrapper
           fetch-depth: 1
 
@@ -414,22 +414,41 @@ jobs:
           if [ "${{ matrix.lgpl }}" = "true" ]; then
             git am --3way ../wrapper/compile-lgpl-libmpv.patch
           fi
+          # Enable packages/mpv-*.patch support before editing packages/mpv.cmake.
+          # 0000-mpv-add-patch.patch touches packages/mpv.cmake, so applying it
+          # after sed edits causes: "Your local changes ... would be overwritten".
+          if compgen -G "packages/mpv-*.patch" > /dev/null; then
+            echo "mpv patch files exist:"
+            ls -l packages/mpv-*.patch
+            if grep -q 'PATCH_COMMAND.*mpv-\*.patch' packages/mpv.cmake; then
+              echo "mpv package patch support is already active"
+            else
+              echo "enabling mpv package patch support via wrapper/patch_pr/0000-mpv-add-patch.patch"
+              git am --3way ../wrapper/patch_pr/0000-mpv-add-patch.patch || {
+                git am --abort || true
+                echo "::error::failed to apply wrapper/patch_pr/0000-mpv-add-patch.patch"
+                exit 1
+              }
+            fi
+          else
+            echo "no packages/mpv-*.patch files, skipping mpv package patch support"
+          fi
+
           # Use the-database/mpv as the mpv source and pin it to the
           # 2026-06-18 working AnimeJaNai snapshot. This workflow itself may live
           # on a newer fork, but the build wrapper and package patches above are
-          # taken from the 8c5353dc snapshot.
-          sed -i 's|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
-          sed -i '/GIT_REPOSITORY .*mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
-
-          # Enable packages/mpv-*.patch support when local fps patches are present.
-          if compgen -G "packages/mpv-*.patch" > /dev/null; then
-            if ! grep -q 'PATCH_COMMAND.*mpv-\*.patch' packages/mpv.cmake; then
-              git am --3way ../wrapper/patch_pr/0000-mpv-add-patch.patch || git am --abort
-            fi
+          # taken from the b7423e62 2026-06-18 successful-run snapshot.
+          sed -i 's|https://github.com/mpv-player/mpv.git|https://github.com/the-database/mpv.git|g; s|mpv-player/mpv\.git|the-database/mpv.git|g' packages/mpv.cmake
+          if ! grep -q '9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake; then
+            sed -i '/GIT_REPOSITORY .*the-database\/mpv\.git/a\    GIT_TAG 9bb5fe9680718d6b9f654ee8e978caf0280b9a27' packages/mpv.cmake
           fi
 
-          git add packages/mpv.cmake && \
+          if ! git diff --quiet -- packages/mpv.cmake; then
+            git add packages/mpv.cmake
             git -c user.name=ci -c user.email=ci@local commit -m "redirect and pin mpv source"
+          else
+            echo "packages/mpv.cmake already redirected and pinned"
+          fi
 
           # If a source cache restored a newer mpv checkout, force only mpv back
           # to the known working commit. Do not reset every dependency here.
@@ -452,8 +471,11 @@ jobs:
           # build cache restored stale stamps from a newer build.
           rm -rf build${{ matrix.bit }}/packages/mpv-prefix || true
 
-          echo "=== effective mpv.cmake ==="
-          grep -n -A8 -B4 'GIT_REPOSITORY .*mpv' packages/mpv.cmake
+          echo "=== effective mpv.cmake: mpv source ==="
+          grep -n -A12 -B4 'GIT_REPOSITORY .*mpv' packages/mpv.cmake || true
+          echo "=== effective mpv.cmake: PATCH_COMMAND ==="
+          grep -n 'PATCH_COMMAND' packages/mpv.cmake || true
+          grep -n 'mpv-\*.patch' packages/mpv.cmake || true
           echo "=== local mpv patches ==="
           ls -l packages/mpv-*.patch || true
 
