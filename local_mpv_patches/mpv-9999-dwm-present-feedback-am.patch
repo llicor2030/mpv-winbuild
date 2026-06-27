@@ -1,6 +1,6 @@
-From b9fe5b563c871c4df0502351af9e121431d3ac6d Mon Sep 17 00:00:00 2001
+From 8460c74fbdd56aa373d94356c317ce6491f6b69f Mon Sep 17 00:00:00 2001
 From: t <t@t.t>
-Date: Sat, 27 Jun 2026 02:47:44 +0000
+Date: Sat, 27 Jun 2026 06:48:07 +0000
 Subject: [PATCH] vo/vulkan/win: use DWM composition timing for real present
  feedback
 
@@ -9,35 +9,36 @@ mp_time_ns() timestamp taken right after flip_page(). A later attempt fed
 vo.c a synthesised timestamp grid stepped by the nominal period; that kept
 estimated-display-fps pinned to the true rate but, because the grid is not
 the real present time, vo_get_delay()/the A/V difference were wrong whenever
-the grid re-anchored (startup resolution reconfigs, seeks, filter stalls).
-display-sync then dropped a burst of frames to correct a phantom drift
-(~120 output/mistimed drops in the first seconds of AnimeJaNai warmup),
-which does not happen on d3d11 (real GetFrameStatistics) or with no patch
-(real raw mp_time_ns).
+the grid re-anchored (startup resolution reconfigs, seeks, filter stalls),
+so display-sync dropped frames to "correct" a phantom drift. This does not
+happen on d3d11 (real GetFrameStatistics) or with no patch (real raw
+mp_time_ns).
 
 This backend has no exclusive-fullscreen mode (only d3d11 does), so it is
 always DWM-composited and DWM owns the real present timeline. Use
-DwmGetCompositionTimingInfo: it is the direct analogue of the d3d11 backend's
+DwmGetCompositionTimingInfo: the direct analogue of the d3d11 backend's
 IDXGISwapChain::GetFrameStatistics path, giving the true vblank phase and
-refresh period. last_queue_display_time is anchored to the real qpcVBlank and
-converted to mp_time with the same adjacent-sample QPC<->mp_time mapping the
-d3d11 backend uses, so vo_get_delay()/A-V diff are accurate and display-sync
-no longer drops frames, while the exact refresh period still prevents the
-24.000-vs-23.976 estimated-rate drift. On any DWM failure we return and let
-vo.c use its raw mp_time_ns() fallback. The hardware vsync lock still comes
-from VK_PRESENT_MODE_FIFO_KHR.
+refresh period. last_queue_display_time is anchored to the real qpcVBlank
+and converted to mp_time with the same adjacent-sample QPC<->mp_time mapping
+the d3d11 backend uses, so vo_get_delay()/A-V diff are accurate and
+display-sync no longer drops frames, while the exact refresh period still
+prevents the 24.000-vs-23.976 estimated-rate drift. On any DWM failure we
+return and let vo.c use its raw mp_time_ns() fallback. The hardware vsync
+lock still comes from VK_PRESENT_MODE_FIFO_KHR.
 ---
- video/out/vulkan/context_win.c | 103 ++++++++++++++++++++++++++++++++-
- 1 file changed, 102 insertions(+), 1 deletion(-)
+ video/out/vulkan/context_win.c | 105 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 104 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..b248787 100644
+index 43bdcf2..c9d660c 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
-@@ -15,9 +15,13 @@
+@@ -15,9 +15,15 @@
   * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
   */
  
++#include <math.h>
++
 +#include <windows.h>
 +#include <dwmapi.h>
 +
@@ -48,7 +49,7 @@ index 43bdcf2..b248787 100644
  
  #include "common.h"
  #include "context.h"
-@@ -29,6 +33,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+@@ -29,6 +35,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  struct priv {
      struct mpvk_ctx vk;
      struct mp_dxgi_factory_ctx dxgi_ctx;
@@ -59,7 +60,7 @@ index 43bdcf2..b248787 100644
  };
  
  static void win_uninit(struct ra_ctx *ctx)
-@@ -63,6 +71,92 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
+@@ -63,6 +73,92 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
      return (struct pl_color_space){0};
  }
  
@@ -152,7 +153,7 @@ index 43bdcf2..b248787 100644
  static bool win_init(struct ra_ctx *ctx)
  {
      struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
-@@ -87,6 +181,7 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -87,6 +183,7 @@ static bool win_init(struct ra_ctx *ctx)
      struct ra_ctx_params params = {
          .color_depth = color_depth,
          .preferred_csp = preferred_csp,
@@ -160,7 +161,7 @@ index 43bdcf2..b248787 100644
      };
  
      VkInstance inst = vk->vkinst->instance;
-@@ -99,6 +194,8 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -99,6 +196,8 @@ static bool win_init(struct ra_ctx *ctx)
      if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
          goto error;
  
@@ -169,7 +170,7 @@ index 43bdcf2..b248787 100644
      return true;
  
  error:
-@@ -114,7 +211,9 @@ static bool resize(struct ra_ctx *ctx)
+@@ -114,7 +213,9 @@ static bool resize(struct ra_ctx *ctx)
  static bool win_reconfig(struct ra_ctx *ctx)
  {
      vo_w32_config(ctx->vo);
@@ -180,7 +181,7 @@ index 43bdcf2..b248787 100644
  }
  
  static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
-@@ -124,6 +223,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+@@ -124,6 +225,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
          if (!resize(ctx))
              return VO_ERROR;
      }
