@@ -1,30 +1,39 @@
-From c15cce3d49ed6c9787afbd0344cb72b85de3c444 Mon Sep 17 00:00:00 2001
+From 57f9f8dd817261056b7877f0b582edda09c19a94 Mon Sep 17 00:00:00 2001
 From: t <t@t.t>
-Date: Sat, 27 Jun 2026 13:13:04 +0000
-Subject: [PATCH] vo/vulkan/win: derive present-feedback phase purely from
- qpcVBlank
+Date: Sat, 27 Jun 2026 17:23:21 +0000
+Subject: [PATCH] vo/vulkan/win + w32: lock display-sync to the real DWM
+ present cadence
 
-The previous revision computed the predicted display time as the first vblank
-after "now" (floor((now - qpcVBlank)/period)+1). Because the offset between the
-get_vsync call time and the reported qpcVBlank wanders, that frame count
-flipped across a period boundary every few frames: vsync jitter spiked
-(~0.045) and the reported cadence was biased high to ~24.000 even though the
-period itself (qpcRefreshPeriod ~23.976) was stable -> drops returned.
+Two halves of the same fix for A/V drift on the DWM-composited (gpu-api=vulkan,
+no exclusive-fullscreen) path, which DX11 avoids because exclusive-fullscreen
+scans out the exact mode rate and uses GetFrameStatistics:
 
-Anchor the phase ONLY to the real DWM timeline: target = qpcVBlank + period.
-"now" is used solely to convert QPC to mp_time, exactly like the d3d11 backend
-(SyncQPCTime + n*period, now only for the QPC<->mp_time mapping). The per-frame
-deltas now equal the real qpcVBlank spacing, so the cadence is smooth and
-unbiased; any constant queue-depth offset is absorbed by display-sync's
-steady-state phase term. Period still comes from DWM's smoothed
-qpcRefreshPeriod / rateRefresh, and the qpcVBlank/cRefresh measurement remains
-a once-per-second diagnostic only.
+1) vo/vulkan/win (context_win.c): provide get_vsync from DWM. A phase-locked
+   cursor advances by exactly one DWM refresh period per swap (clean, low-jitter
+   estimated-display-fps) and is pulled gently toward the real qpcVBlank phase
+   (error wrapped to +/-half a period, 1/16 per frame; >4-period gap re-anchors).
+   This keeps last_queue_display_time tied to real present time without injecting
+   the call-timing jitter that a cursor-less, qpcVBlank/now derivation caused.
+
+2) w32_common (update_display_info): report the real DWM composition refresh
+   (DwmGetCompositionTimingInfo rateRefresh / qpcRefreshPeriod) as display-fps,
+   preferred over the registered mode rate. The desktop "24000/1001" mode
+   actually composites at ~23.9758 Hz; reporting the mode's 23.976024 left the
+   display-sync audio-resample target ~0.001% off the real scan-out (and, over
+   HDMI, off the audio clock locked to it), so the A/V difference crept until
+   frames dropped. In true exclusive fullscreen DwmGetCompositionTimingInfo
+   fails and we fall back to the mode rate, which is then the real scan-out
+   rate, so the d3d11 path is unchanged.
+
+With both, nominal, estimated and the present feedback all equal the real
+~23.9758 Hz cadence, so audio stays locked to video with no drift or drops.
 ---
- video/out/vulkan/context_win.c | 109 +++++++++++++++++++++++++++++++++
- 1 file changed, 109 insertions(+)
+ video/out/vulkan/context_win.c | 146 ++++++++++++++++++++++++++++++++-
+ video/out/w32_common.c         |  35 ++++++++
+ 2 files changed, 180 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..ef09e1d 100644
+index 43bdcf2..738bb77 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,9 +15,15 @@
@@ -48,41 +57,67 @@ index 43bdcf2..ef09e1d 100644
      struct mpvk_ctx vk;
      struct mp_dxgi_factory_ctx dxgi_ctx;
 +
-+    // DWM present feedback, derived single-source (like the d3d11 backend):
-+    // both vsync_duration and last_queue_display_time come from the SAME
-+    // measured vblank cadence, so there is no basis mismatch to integrate into
-+    // an A/V drift. See win_vk_get_vsync().
-+    int64_t last_vblank_qpc;       // previous DwmGetCompositionTimingInfo qpcVBlank
-+    int64_t last_refresh_count;    // previous cRefresh (vblank counter)
-+    int64_t vsync_duration_qpc;    // measured refresh period in QPC units
-+    int64_t dbg_last_log_ns;       // debug log rate-limit
++    // Fallback display period in ns from VOCTRL_GET_DISPLAY_FPS, used only if
++    // DWM does not report a usable refresh period. See win_vk_get_vsync().
++    int64_t vsync_period;
++
++    // Phase-locked predicted display time in QPC units (0 = unset). Advanced by
++    // one exact refresh period per swap and gently pulled toward the real DWM
++    // vblank phase (a first-order PLL). See win_vk_get_vsync().
++    int64_t vsync_cursor_qpc;
  };
  
  static void win_uninit(struct ra_ctx *ctx)
-@@ -63,6 +78,99 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
+@@ -63,6 +78,128 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
      return (struct pl_color_space){0};
  }
  
 +static int64_t qpc_to_ns(int64_t perf_freq, int64_t qpc)
 +{
-+    // Overflow-safe QPC(1/perf_freq s) -> ns, identical to the d3d11 backend.
++    // Convert QPC units (1/perf_freq s) to ns without overflow, exactly as the
++    // d3d11 backend does: QPC cannot roll over within ~100 years, so perf_freq
++    // is well under 2.9e9 and the split multiply stays in range.
 +    return qpc / perf_freq * INT64_C(1000000000) +
 +           qpc % perf_freq * INT64_C(1000000000) / perf_freq;
++}
++
++static void win_update_vsync_period(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++
++    // Exact for NTSC modes (e.g. 23.976 Hz -> 41708333 ns). Only a fallback for
++    // the rare case where DWM reports no usable period; never clobber a known
++    // value with 0 (VOCTRL_GET_DISPLAY_FPS can transiently fail on win-state
++    // changes), which would otherwise strand us on vo.c's raw fallback.
++    int events = 0;
++    double fps = 0;
++    if (vo_w32_control(ctx->vo, &events, VOCTRL_GET_DISPLAY_FPS, &fps) != VO_TRUE)
++        fps = 0;
++    if (fps > 1.0) {
++        int64_t period = llrint(1e9 / fps);
++        if (period != p->vsync_period)
++            p->vsync_cursor_qpc = 0;   // re-anchor PLL when the rate changes
++        p->vsync_period = period;
++    }
 +}
 +
 +static void win_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
 +{
 +    struct priv *p = ctx->priv;
 +
-+    // This backend has no exclusive-fullscreen mode (only d3d11 does); it is
-+    // always DWM-composited, so DWM owns the real present timeline. Mirror the
-+    // d3d11 backend's GetFrameStatistics logic exactly, but with DWM's
-+    // qpcVBlank (== SyncQPCTime) and cRefresh (== SyncRefreshCount): measure the
-+    // refresh PERIOD from consecutive samples and derive BOTH vsync_duration and
-+    // last_queue_display_time from that one measurement. Deriving them from a
-+    // single source is what keeps vo_get_delay()/the A/V difference from
-+    // accumulating drift. On failure we return and vo.c uses its raw
-+    // mp_time_ns() fallback.
++    // This backend has no exclusive-fullscreen mode (only d3d11 does), so it is
++    // always DWM-composited: DWM, not the Vulkan swapchain, owns the real
++    // present timeline. DwmGetCompositionTimingInfo is therefore the direct
++    // analogue of the d3d11 backend's IDXGISwapChain::GetFrameStatistics path.
++    // It yields the *true* vblank phase and refresh period, so vo.c computes an
++    // accurate vo_get_delay() / A/V difference and display-sync stops dropping
++    // frames to "correct" a phantom drift (the symptom of feeding it a
++    // synthesised timestamp grid, which diverges from real present time across
++    // startup reconfigs, seeks and filter stalls).
++    //
++    // On any failure we simply return: vo.c then falls back to the raw
++    // post-swap mp_time_ns() timestamp, which is also real timing (just noisier)
++    // and never worse than this used to be.
 +    DWM_TIMING_INFO dwm = { .cbSize = sizeof(DWM_TIMING_INFO) };
 +    if (FAILED(DwmGetCompositionTimingInfo(NULL, &dwm)))
 +        return;
@@ -92,74 +127,77 @@ index 43bdcf2..ef09e1d 100644
 +        return;
 +    int64_t perf_freq = freq.QuadPart;
 +
-+    int64_t vblank  = (int64_t)dwm.qpcVBlank;
-+    int64_t refresh = (int64_t)dwm.cRefresh;
-+
-+    // Refresh PERIOD: use DWM's own smoothed value (qpcRefreshPeriod, or the
-+    // exact rational rateRefresh). Do NOT derive it from the per-call
-+    // qpcVBlank/cRefresh delta: get_vsync runs once per frame, so that delta
-+    // spans ~1 vblank and is far too noisy (it jittered the whole cadence and
-+    // broke playback). qpcRefreshPeriod is already averaged by DWM and stable.
-+    int64_t period_qpc = (int64_t)dwm.qpcRefreshPeriod;
-+    if (period_qpc <= 0 && dwm.rateRefresh.uiNumerator && dwm.rateRefresh.uiDenominator)
++    // Exact refresh period in QPC units. Prefer DWM's exact rational refresh
++    // rate (e.g. 24000/1001 -> true 23.976), since qpcRefreshPeriod is rounded
++    // (it reports ~24.000 for a 23.976 mode); fall back to the measured period,
++    // then mpv's VOCTRL rate.
++    int64_t period_qpc = 0;
++    if (dwm.rateRefresh.uiNumerator && dwm.rateRefresh.uiDenominator)
 +        period_qpc = perf_freq * dwm.rateRefresh.uiDenominator /
 +                     dwm.rateRefresh.uiNumerator;
++    if (period_qpc <= 0)
++        period_qpc = (int64_t)dwm.qpcRefreshPeriod;
++    if (period_qpc <= 0 && p->vsync_period > 0)
++        period_qpc = p->vsync_period * perf_freq / INT64_C(1000000000);
 +    if (period_qpc <= 0)
 +        return;
 +
 +    info->vsync_duration = qpc_to_ns(perf_freq, period_qpc);
++
++    // Skip detection is possible via DWM counters but not implemented; never
++    // claim any so the skip detector cannot misfire during trick play.
 +    info->skipped_vsyncs = -1;
 +
-+    // Display time of the just-flipped frame = the vblank AFTER the most recent
-+    // real one: qpcVBlank + one period. The phase comes ONLY from qpcVBlank
-+    // (the real DWM present timeline), never from "now": using "now" (call time)
-+    // made the offset (now - qpcVBlank) wander across a period boundary every
-+    // few frames, which flipped the frame count, jittered vsync and biased the
-+    // reported cadence high (~24.000). This mirrors the d3d11 backend, which
-+    // anchors purely to SyncQPCTime + n*period and uses "now" only to convert
-+    // QPC to mp_time. The per-frame deltas therefore equal the real qpcVBlank
-+    // spacing -> smooth, no jitter. Any constant queue-depth offset is absorbed
-+    // by display-sync's steady-state phase term.
-+    LARGE_INTEGER qn;
-+    QueryPerformanceCounter(&qn);
-+    int64_t now_qpc = qn.QuadPart;
-+    int64_t target = vblank + period_qpc;
++    LARGE_INTEGER qpc_now_li;
++    QueryPerformanceCounter(&qpc_now_li);
++    int64_t now_qpc = qpc_now_li.QuadPart;
++
++    // Real next vblank strictly after "now", derived from the actual DWM vblank
++    // phase. Use floor (not ceil) so a slightly-stale qpcVBlank does not jump a
++    // whole period -- that off-by-one was the source of the unstable, sometimes
++    // >refresh estimated-fps readings.
++    int64_t vblank_qpc = (int64_t)dwm.qpcVBlank;
++    int64_t k = (now_qpc - vblank_qpc) / period_qpc;   // floor for now >= vblank
++    if (now_qpc < vblank_qpc)
++        k -= 1;
++    int64_t next_real = vblank_qpc + (k + 1) * period_qpc;
++
++    // First-order PLL. Rather than re-deriving the timestamp from qpcVBlank
++    // every frame (which injects the snap jitter above and lets the reported
++    // cadence wander), advance a cursor by *exactly* one period per swap and
++    // pull it gently toward the real vblank phase. This gives vo.c clean,
++    // exact-period deltas (stable estimated-display-fps) while staying phase-
++    // locked to real present time, so vo_get_delay()/the A/V difference cannot
++    // accumulate the slow drift that used to start a burst of drops the player
++    // could only escape with a seek.
++    int64_t cursor = p->vsync_cursor_qpc;
++    int64_t diff = cursor - next_real;
++    if (diff < 0)
++        diff = -diff;
++    if (cursor <= 0 || diff > 4 * period_qpc) {
++        // Unset, or a hard discontinuity (startup, seek, pause/resume, mode
++        // change): re-anchor on the real phase so we self-recover without a
++        // user seek.
++        cursor = next_real;
++    } else {
++        cursor += period_qpc;                      // clean exact step
++        int64_t err = (next_real - cursor) % period_qpc;   // (-period, period)
++        if (err > period_qpc / 2)
++            err -= period_qpc;
++        else if (err < -period_qpc / 2)
++            err += period_qpc;
++        cursor += err / 16;                         // slow phase correction
++    }
++    p->vsync_cursor_qpc = cursor;
 +
 +    info->last_queue_display_time = mp_time_ns() +
-+        (qpc_to_ns(perf_freq, target) - qpc_to_ns(perf_freq, now_qpc));
-+
-+    // Diagnostic only: a coarse per-second cadence estimate from the
-+    // qpcVBlank/cRefresh delta (NOT used for timing above).
-+    int64_t measured_qpc = 0;
-+    if (p->last_refresh_count && refresh > p->last_refresh_count &&
-+        p->last_vblank_qpc && vblank > p->last_vblank_qpc)
-+        measured_qpc = (vblank - p->last_vblank_qpc) /
-+                       (refresh - p->last_refresh_count);
-+    p->last_refresh_count = refresh;
-+    p->last_vblank_qpc = vblank;
-+
-+    // ---- DEBUG (about once per second) ----
-+    int64_t tnow = mp_time_ns();
-+    if (tnow - p->dbg_last_log_ns > INT64_C(1000000000)) {
-+        p->dbg_last_log_ns = tnow;
-+        double meas_hz = measured_qpc > 0 ? (double)perf_freq / (double)measured_qpc : 0.0;
-+        double rr_hz = dwm.rateRefresh.uiDenominator
-+            ? (double)dwm.rateRefresh.uiNumerator / (double)dwm.rateRefresh.uiDenominator
-+            : 0.0;
-+        double qrp_hz = dwm.qpcRefreshPeriod
-+            ? (double)perf_freq / (double)dwm.qpcRefreshPeriod : 0.0;
-+        MP_WARN(ctx, "DWM: measured=%.6f Hz (period_qpc=%lld) "
-+                     "rateRefresh=%u/%u=%.6f qpcRefreshPeriod=%.6f Hz cRefresh=%lld\n",
-+                meas_hz, (long long)period_qpc,
-+                dwm.rateRefresh.uiNumerator, dwm.rateRefresh.uiDenominator, rr_hz,
-+                qrp_hz, (long long)refresh);
-+    }
++        (qpc_to_ns(perf_freq, cursor) - qpc_to_ns(perf_freq, now_qpc));
 +}
 +
  static bool win_init(struct ra_ctx *ctx)
  {
      struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
-@@ -87,6 +195,7 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -87,6 +224,7 @@ static bool win_init(struct ra_ctx *ctx)
      struct ra_ctx_params params = {
          .color_depth = color_depth,
          .preferred_csp = preferred_csp,
@@ -167,6 +205,88 @@ index 43bdcf2..ef09e1d 100644
      };
  
      VkInstance inst = vk->vkinst->instance;
+@@ -99,6 +237,8 @@ static bool win_init(struct ra_ctx *ctx)
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto error;
+ 
++    win_update_vsync_period(ctx);
++
+     return true;
+ 
+ error:
+@@ -114,7 +254,9 @@ static bool resize(struct ra_ctx *ctx)
+ static bool win_reconfig(struct ra_ctx *ctx)
+ {
+     vo_w32_config(ctx->vo);
+-    return resize(ctx);
++    bool ok = resize(ctx);
++    win_update_vsync_period(ctx);
++    return ok;
+ }
+ 
+ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+@@ -124,6 +266,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+         if (!resize(ctx))
+             return VO_ERROR;
+     }
++    if (*events & (VO_EVENT_RESIZE | VO_EVENT_WIN_STATE))
++        win_update_vsync_period(ctx);
+     return ret;
+ }
+ 
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index ba4f382..1618732 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -586,6 +586,39 @@ static void wakeup_gui_thread(void *ctx)
+     }
+ }
+ 
++static double get_refresh_rate_from_dwm(void)
++{
++    // On the DWM-composited desktop (windowed, or any backend without an
++    // exclusive-fullscreen mode set, e.g. gpu-api=vulkan on Win32) the real
++    // present cadence is DWM's composition refresh, which can differ slightly
++    // from the registered mode rate (e.g. ~23.9758 for a "24000/1001" mode).
++    // Reporting that real rate keeps display-sync's audio resampling locked to
++    // the actual scan-out (and, over HDMI, to the audio clock derived from it).
++    // In true exclusive fullscreen DwmGetCompositionTimingInfo fails, so the
++    // caller falls back to the mode rate, which is then the real scan-out rate.
++    DWM_TIMING_INFO dwm = { .cbSize = sizeof(DWM_TIMING_INFO) };
++    if (FAILED(DwmGetCompositionTimingInfo(NULL, &dwm)))
++        return 0.0;
++
++    if (dwm.rateRefresh.uiNumerator && dwm.rateRefresh.uiDenominator) {
++        double rv = (double)dwm.rateRefresh.uiNumerator /
++                    (double)dwm.rateRefresh.uiDenominator;
++        if (rv > 1.0)
++            return rv;
++    }
++
++    LARGE_INTEGER freq;
++    if (dwm.qpcRefreshPeriod && QueryPerformanceFrequency(&freq) &&
++        freq.QuadPart > 0)
++    {
++        double rv = (double)freq.QuadPart / (double)dwm.qpcRefreshPeriod;
++        if (rv > 1.0)
++            return rv;
++    }
++
++    return 0.0;
++}
++
+ static double get_refresh_rate_from_gdi(const wchar_t *device)
+ {
+     DEVMODEW dm = { .dmSize = sizeof dm };
+@@ -682,6 +715,8 @@ static void update_display_info(struct vo_w32_state *w32)
+     // Try to get the monitor refresh rate.
+     double freq = 0.0;
+ 
++    if (freq == 0.0)
++        freq = get_refresh_rate_from_dwm();
+     if (freq == 0.0)
+         freq = mp_w32_displayconfig_get_refresh_rate(mi.szDevice);
+     if (freq == 0.0)
 -- 
 2.43.0
 
