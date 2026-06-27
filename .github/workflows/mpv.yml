@@ -703,6 +703,28 @@ jobs:
           echo "Rebuild clang_root/LLVM = ${{ inputs.rebuild_llvm }}"
           echo "For exact dependency repro: repro_618_deps=true, rebuild_llvm=false unless LLVM cache is known bad."
 
+          # Patched packages were de-sparsified above so a FRESH clone keeps the
+          # blobs that "git am --3way" needs. But a cache-restored src_packages/<pkg>
+          # is still the OLD blobless (--filter=tree:0) clone, and ExternalProject
+          # will not re-clone an existing dir, so the bundled patch still dies with
+          # "could not build fake ancestor". For each patched package (no GIT_RESET)
+          # whose cached source is still a partial clone, drop the cached source and
+          # its build prefix to force a fresh full clone + re-patch. Once a full
+          # clone is cached this is skipped, so it does not re-clone every run.
+          # (mpv has its own dedicated rebuild block above and is excluded here.)
+          echo "=== force fresh full clone for blobless patched packages ==="
+          for cm in packages/*.cmake; do
+            pkg=$(basename "$cm" .cmake)
+            [ "$pkg" = mpv ] && continue
+            if compgen -G "packages/${pkg}-*.patch" > /dev/null && ! grep -q 'GIT_RESET' "$cm"; then
+              if [ -d "src_packages/${pkg}/.git" ] && \
+                 git -C "src_packages/${pkg}" config --get remote.origin.partialclonefilter >/dev/null 2>&1; then
+                echo "PATCHED-PKG CLEAN (cached clone is blobless): ${pkg}"
+                rm -rf "src_packages/${pkg}" "build${{ matrix.bit }}/packages/${pkg}-prefix"
+              fi
+            fi
+          done
+
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
         if: ${{ always() }}
