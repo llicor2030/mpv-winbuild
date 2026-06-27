@@ -1,0 +1,194 @@
+From b9fe5b563c871c4df0502351af9e121431d3ac6d Mon Sep 17 00:00:00 2001
+From: t <t@t.t>
+Date: Sat, 27 Jun 2026 02:47:44 +0000
+Subject: [PATCH] vo/vulkan/win: use DWM composition timing for real present
+ feedback
+
+The Win32/Vulkan context provided no get_vsync, so vo.c fell back to the
+mp_time_ns() timestamp taken right after flip_page(). A later attempt fed
+vo.c a synthesised timestamp grid stepped by the nominal period; that kept
+estimated-display-fps pinned to the true rate but, because the grid is not
+the real present time, vo_get_delay()/the A/V difference were wrong whenever
+the grid re-anchored (startup resolution reconfigs, seeks, filter stalls).
+display-sync then dropped a burst of frames to correct a phantom drift
+(~120 output/mistimed drops in the first seconds of AnimeJaNai warmup),
+which does not happen on d3d11 (real GetFrameStatistics) or with no patch
+(real raw mp_time_ns).
+
+This backend has no exclusive-fullscreen mode (only d3d11 does), so it is
+always DWM-composited and DWM owns the real present timeline. Use
+DwmGetCompositionTimingInfo: it is the direct analogue of the d3d11 backend's
+IDXGISwapChain::GetFrameStatistics path, giving the true vblank phase and
+refresh period. last_queue_display_time is anchored to the real qpcVBlank and
+converted to mp_time with the same adjacent-sample QPC<->mp_time mapping the
+d3d11 backend uses, so vo_get_delay()/A-V diff are accurate and display-sync
+no longer drops frames, while the exact refresh period still prevents the
+24.000-vs-23.976 estimated-rate drift. On any DWM failure we return and let
+vo.c use its raw mp_time_ns() fallback. The hardware vsync lock still comes
+from VK_PRESENT_MODE_FIFO_KHR.
+---
+ video/out/vulkan/context_win.c | 103 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
+index 43bdcf2..b248787 100644
+--- a/video/out/vulkan/context_win.c
++++ b/video/out/vulkan/context_win.c
+@@ -15,9 +15,13 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <windows.h>
++#include <dwmapi.h>
++
+ #include "video/out/gpu/context.h"
+ #include "video/out/gpu/d3d11_helpers.h"
+ #include "video/out/w32_common.h"
++#include "osdep/timer.h"
+ 
+ #include "common.h"
+ #include "context.h"
+@@ -29,6 +33,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+ struct priv {
+     struct mpvk_ctx vk;
+     struct mp_dxgi_factory_ctx dxgi_ctx;
++
++    // Fallback display period in ns from VOCTRL_GET_DISPLAY_FPS, used only if
++    // DWM does not report a usable refresh period. See win_vk_get_vsync().
++    int64_t vsync_period;
+ };
+ 
+ static void win_uninit(struct ra_ctx *ctx)
+@@ -63,6 +71,92 @@ static struct pl_color_space preferred_csp(struct ra_ctx *ctx)
+     return (struct pl_color_space){0};
+ }
+ 
++static int64_t qpc_to_ns(int64_t perf_freq, int64_t qpc)
++{
++    // Convert QPC units (1/perf_freq s) to ns without overflow, exactly as the
++    // d3d11 backend does: QPC cannot roll over within ~100 years, so perf_freq
++    // is well under 2.9e9 and the split multiply stays in range.
++    return qpc / perf_freq * INT64_C(1000000000) +
++           qpc % perf_freq * INT64_C(1000000000) / perf_freq;
++}
++
++static void win_update_vsync_period(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++
++    // Exact for NTSC modes (e.g. 23.976 Hz -> 41708333 ns). Only a fallback for
++    // the rare case where DWM reports no usable period; never clobber a known
++    // value with 0 (VOCTRL_GET_DISPLAY_FPS can transiently fail on win-state
++    // changes), which would otherwise strand us on vo.c's raw fallback.
++    int events = 0;
++    double fps = 0;
++    if (vo_w32_control(ctx->vo, &events, VOCTRL_GET_DISPLAY_FPS, &fps) != VO_TRUE)
++        fps = 0;
++    if (fps > 1.0)
++        p->vsync_period = llrint(1e9 / fps);
++}
++
++static void win_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    struct priv *p = ctx->priv;
++
++    // This backend has no exclusive-fullscreen mode (only d3d11 does), so it is
++    // always DWM-composited: DWM, not the Vulkan swapchain, owns the real
++    // present timeline. DwmGetCompositionTimingInfo is therefore the direct
++    // analogue of the d3d11 backend's IDXGISwapChain::GetFrameStatistics path.
++    // It yields the *true* vblank phase and refresh period, so vo.c computes an
++    // accurate vo_get_delay() / A/V difference and display-sync stops dropping
++    // frames to "correct" a phantom drift (the symptom of feeding it a
++    // synthesised timestamp grid, which diverges from real present time across
++    // startup reconfigs, seeks and filter stalls).
++    //
++    // On any failure we simply return: vo.c then falls back to the raw
++    // post-swap mp_time_ns() timestamp, which is also real timing (just noisier)
++    // and never worse than this used to be.
++    DWM_TIMING_INFO dwm = { .cbSize = sizeof(DWM_TIMING_INFO) };
++    if (FAILED(DwmGetCompositionTimingInfo(NULL, &dwm)))
++        return;
++
++    LARGE_INTEGER freq;
++    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0)
++        return;
++    int64_t perf_freq = freq.QuadPart;
++
++    // Real refresh period in QPC units: prefer DWM's measured period, then its
++    // exact rational refresh rate, then mpv's VOCTRL rate as a last resort.
++    int64_t period_qpc = (int64_t)dwm.qpcRefreshPeriod;
++    if (period_qpc <= 0 && dwm.rateRefresh.uiNumerator)
++        period_qpc = perf_freq * dwm.rateRefresh.uiDenominator /
++                     dwm.rateRefresh.uiNumerator;
++    if (period_qpc <= 0 && p->vsync_period > 0)
++        period_qpc = p->vsync_period * perf_freq / INT64_C(1000000000);
++    if (period_qpc <= 0)
++        return;
++
++    info->vsync_duration = qpc_to_ns(perf_freq, period_qpc);
++
++    // Skip detection is possible via DWM counters but not implemented; never
++    // claim any so the skip detector cannot misfire during trick play.
++    info->skipped_vsyncs = -1;
++
++    // Predict the display time of the just-flipped frame as the first real DWM
++    // vblank at or after "now". Anchoring last_queue_display_time to the actual
++    // qpcVBlank phase (not a synthesised grid) is what keeps the per-frame
++    // timing honest; the conversion to mp_time uses the same adjacent-sample
++    // QPC<->mp_time mapping as the d3d11 backend.
++    LARGE_INTEGER qpc_now_li;
++    QueryPerformanceCounter(&qpc_now_li);
++    int64_t now_qpc = qpc_now_li.QuadPart;
++    int64_t vblank_qpc = (int64_t)dwm.qpcVBlank;
++    if (vblank_qpc < now_qpc) {
++        int64_t n = (now_qpc - vblank_qpc + period_qpc - 1) / period_qpc;
++        vblank_qpc += n * period_qpc;
++    }
++
++    info->last_queue_display_time = mp_time_ns() +
++        (qpc_to_ns(perf_freq, vblank_qpc) - qpc_to_ns(perf_freq, now_qpc));
++}
++
+ static bool win_init(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+@@ -87,6 +181,7 @@ static bool win_init(struct ra_ctx *ctx)
+     struct ra_ctx_params params = {
+         .color_depth = color_depth,
+         .preferred_csp = preferred_csp,
++        .get_vsync = win_vk_get_vsync,
+     };
+ 
+     VkInstance inst = vk->vkinst->instance;
+@@ -99,6 +194,8 @@ static bool win_init(struct ra_ctx *ctx)
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto error;
+ 
++    win_update_vsync_period(ctx);
++
+     return true;
+ 
+ error:
+@@ -114,7 +211,9 @@ static bool resize(struct ra_ctx *ctx)
+ static bool win_reconfig(struct ra_ctx *ctx)
+ {
+     vo_w32_config(ctx->vo);
+-    return resize(ctx);
++    bool ok = resize(ctx);
++    win_update_vsync_period(ctx);
++    return ok;
+ }
+ 
+ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+@@ -124,6 +223,8 @@ static int win_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+         if (!resize(ctx))
+             return VO_ERROR;
+     }
++    if (*events & (VO_EVENT_RESIZE | VO_EVENT_WIN_STATE))
++        win_update_vsync_period(ctx);
+     return ret;
+ }
+ 
+-- 
+2.43.0
+
