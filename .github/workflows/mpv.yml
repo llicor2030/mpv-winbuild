@@ -429,74 +429,6 @@ jobs:
             mkdir -p src_packages
           fi
 
-          # === write the authoritative 2026-06-18 source lock (61 + aom/ngtcp2/nghttp3) ===
-          cat > ../source-lock-pinned.txt <<'LOCK_EOF'
-          a5216b1dafe476b6de36a316a151c64df575197a  https://bitbucket.org/mpyne/game-music-emu.git
-          14c73c7db38eebfd3202146b76a1ad4df90dd3a2  https://code.videolan.org/videolan/dav1d.git
-          8b4fb6e2562bb86601ea5a2c4140af6d8f3f1cf4  https://code.videolan.org/videolan/libbluray.git
-          2682a4a7ed782e700a5b920f6f85c4f9736921c3  https://code.videolan.org/videolan/libdvdcss.git
-          cf112772bf626f76a913efca5b883a381e4c123a  https://code.videolan.org/videolan/libdvdnav.git
-          6acfc10af09b780b8357c880f89a788d246e520b  https://code.videolan.org/videolan/libdvdread.git
-          139a2194525f2745b98a98e4d8fa627d07440176  https://code.videolan.org/videolan/libudfread.git
-          0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee  https://code.videolan.org/videolan/x264.git
-          e892c9fdbbddba94e52f656ccb378ed4885e30cc  https://codeberg.org/ccxvii/mujs.git
-          553d6bb272f26400d6d4d1cac7c1df84c447449b  https://git.sailfishos.org/mirror/readline.git
-          1b5a81ada8874efb2af0534ffe74049c557e212d  https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
-          f514fea5eef869867f11191123140b173121139d  https://github.com/AviSynth/AviSynthPlus.git
-          f760b2fb6  https://github.com/FFmpeg/FFmpeg.git
-          13a3df99ffe2521a903f270abb33aa7092b34147  https://github.com/GNOME/libxml2.git
-          eadd00804d5f7e5cd8c85d540073198312870776  https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
-          c39196c9a568ae4e3289dd65cf54ba4154deb4a1  https://github.com/Haivision/srt.git
-          d1b97ed0020bc620a059d3675d1854b40bd2608d  https://github.com/Konstanty/libmodplug.git
-          9ca51acb177efa44892683a23b980ee71f47100c  https://github.com/Multicorewareinc/x265.git
-          3ce4bfa3129ff3738046a44a6db533d2ce25af2b  https://github.com/adah1972/libunibreak.git
-          5ca2d59888df047f1e4b028e3a2fd5be8b5a7277  https://github.com/alexmarsev/libbs2b.git
-          e1366945251ae3107194acb970ec4e40b1da5682  https://github.com/curl/curl.git
-          25a08f24cfc0da879d1938352d026532f280b77e  https://github.com/freetype/freetype.git
-          069a7e3d31e6aa74f2068a8e0804106ce7906639  https://github.com/fribidi/fribidi.git
-          dd5d363ae1fc7778f2734bf51b10d3fe65028671  https://github.com/glennrp/libpng.git
-          83fe766bc81f7911a78716b8d3b3d01367009995  https://github.com/google/brotli.git
-          eb3479ebfceac4e2986dce3f902baa086904c4f9  https://github.com/google/highway.git
-          3be579e  https://github.com/haasn/libplacebo.git
-          ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c  https://github.com/intel/libva.git
-          dc98bfbe6064d851e32428db83b06732a448810b  https://github.com/kcat/openal-soft.git
-          22d16a04e4f4c6a537a143c31930fc4e943a2028  https://github.com/libarchive/libarchive.git
-          35ba2ca  https://github.com/libass/libass.git
-          429059e65108ebe9381e49f57b494441eeafefcd  https://github.com/libexpat/libexpat.git
-          2ccde9568cca73c7b32c97fefca2e418c16ae5e3  https://github.com/libsndfile/libsamplerate.git
-          f6aac4576826ed821c81231fdfb0d24047158e7d  https://github.com/lu-zero/mfx_dispatch.git
-          5191dbe5e34b07edae5c248521b6aad6195b440d  https://github.com/meganz/sdk.git
-          76ffc49448b8bd6aa6a36c1f5869ab318831abb9  https://github.com/mm2/Little-CMS.git
-          65871b62828404ed8045f8e5d6c1dafc6b6f6e6a  https://github.com/nghttp2/nghttp2.git
-          a0244db469dfeded64c1289a8bc713194ed0598e  https://github.com/openssl/openssl.git
-          1780afdefdc27881891bbb56add83688a60653d1  https://github.com/rockdaboot/libpsl.git
-          f50435051b72c168c2b566c544e27fcff71ba61a  https://github.com/saindriches/davs2.git
-          a0151d940af8bb0733dac77248bd55ae86949e56  https://github.com/saitoha/libsixel.git
-          7bb77a5c062c610e7f44df6a59155cc3ab3e452a  https://github.com/sekrit-twc/graphengine.git
-          b3647572a01927e2aa8d0b7aaa917207c9c1ae5d  https://github.com/sekrit-twc/zimg.git
-          1c534ce8c21fab0be2a394ad73decc15e015693e  https://github.com/shinchiro/mpv-packaging.git
-          b70af4d5320750acda7cffbd75a3390eede600bd  https://github.com/tukaani-project/xz.git
-          0e20d2c291853f196c68922a264bcd8471d75b68  https://github.com/uavs3/uavs3d.git
-          b430c3a58b64b70642ab5c72c36084dd4083d165  https://github.com/xiph/flac.git
-          3c65f440baff6220872ec11b0cbde37ef7a48f78  https://github.com/xiph/libopusenc.git
-          06a5e0262cdc28aa4ae6797627a783b5010440f0  https://github.com/xiph/ogg.git
-          5f894e95a50b2004d8c8171082a5fd7327f93653  https://github.com/xiph/opus-tools.git
-          6dfd29e7adb87f2e193575fc3fa88cbf1a0b27df  https://github.com/xiph/opusfile.git
-          05895229896dc942d453446eba6f9f5ddcf95422  https://github.com/xiph/speex.git
-          e3c9861ff096d52378e131ff8c334552e09cdffa  https://github.com/xiph/vorbis.git
-          f9d8c50fe5e51c98d101f69d74591295cb568036  https://github.com/xqq/libaribcaption.git
-          7b41a3fc9a0652d2583a71a65ecac2950aafd1da  https://gitlab.com/AOMediaCodec/SVT-AV1.git
-          66c46b8c9436613fd81bc5d03f63a61933a4dcc3  https://gitlab.com/bzip2/bzip2.git
-          e224b86b2f0160b0590d1c6afef77230b812867b  https://gitlab.com/libssh/libssh-mirror.git
-          9a5b35c430a2e6d150d65a96c7d7acdd64962a8f  https://gitlab.com/shinchiro/lame.git
-          66c7ef01faabe7ad6293d6b738d4103de77437b4  https://gitlab.com/shinchiro/nettle.git
-          945b592b70470e29f917f4de89b4281fbbd540c0  https://gitlab.com/shinchiro/soxr.git
-          06029ec3340cdf6bf9a6a537dafb3f39eda0560e  https://gitlab.freedesktop.org/uchardet/uchardet.git
-          3f62de0eddedb9a246d32b150d6bc47baa790282  https://aomedia.googlesource.com/aom.git
-          c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71  https://github.com/ngtcp2/ngtcp2.git
-          056fbdf9102c4fbc40844dd1ae83d467af31dbeb  https://github.com/ngtcp2/nghttp3.git
-          LOCK_EOF
-
           # Local mpv patch refresh path.
           # When build/source caches are restored, mpv ExternalProject may already
           # have completed its patch/build stamps.  Remove only mpv's build prefix
@@ -576,17 +508,13 @@ jobs:
               "llvm/llvm-project": "1f5aee5",
               "mingw-w64": "0034988",
               "zlib-ng/zlib-ng": "5d005c5",
+              # confirmed-drift packages, pinned to verified 2026-06-18 commits
+              "videolan/dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
+              "aomedia.googlesource.com/aom": "3f62de0eddedb9a246d32b150d6bc47baa790282",
+              "ngtcp2/ngtcp2": "c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71",
+              "ngtcp2/nghttp3": "056fbdf9102c4fbc40844dd1ae83d467af31dbeb",
+              "uavs3/uavs3d": "0e20d2c291853f196c68922a264bcd8471d75b68",
           }
-
-          STATIC_LOCK = {}
-          _lf = Path("../source-lock-pinned.txt")
-          if _lf.exists():
-              for _ln in _lf.read_text().splitlines():
-                  _ln = _ln.strip()
-                  if not _ln:
-                      continue
-                  _sha, _url = _ln.split(None, 1)
-                  STATIC_LOCK[_url.strip().rstrip("/").removesuffix(".git")] = _sha.strip()
 
           cache = {}
 
@@ -596,9 +524,6 @@ jobs:
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
 
           def known_commit(url):
-              u = url.strip().rstrip("/").removesuffix(".git")
-              if u in STATIC_LOCK:
-                  return STATIC_LOCK[u]
               for key, val in KNOWN_BY_REPO_PART.items():
                   if key.lower() in url.lower():
                       return val
@@ -806,38 +731,33 @@ jobs:
             fi
           done
 
-          # === align cache-restored sources to the 2026-06-18 lock ===
-          # Cached src_packages/<pkg> keep whatever commit the cache had and drift
-          # forward; reset each to its locked commit so cache builds match 6/18.
-          if [ -f ../source-lock-pinned.txt ]; then
-            declare -A LOCK
-            while read -r sha url; do
-              [ -z "$sha" ] && continue
-              url="${url%.git}"; url="${url%/}"
-              LOCK["$url"]="$sha"
-            done < ../source-lock-pinned.txt
-            for cm in packages/*.cmake; do
-              pkg=$(basename "$cm" .cmake)
-              [ "$pkg" = mpv ] && continue
-              d="src_packages/$pkg"
-              [ -d "$d/.git" ] || continue
-              url=$(grep -oE 'GIT_REPOSITORY[[:space:]]+[^[:space:])"]+' "$cm" | head -1 | awk '{print $2}')
-              url="${url%.git}"; url="${url%/}"
-              sha="${LOCK[$url]}"
-              [ -z "$sha" ] && continue
+          # === align cache-restored sources for confirmed-drift packages only ===
+          # Forcing the FULL lock is unsafe: it contains cutoff-computed values for
+          # stable (GIT_TAG) packages that 6/18 never built (e.g. libsixel a0151d940a
+          # has a loader.c compile bug). Only pin the packages that actually drift,
+          # to verified-good commits. Everything else stays at its cache value.
+          declare -A PIN=(
+            ["dav1d"]="14c73c7db38eebfd3202146b76a1ad4df90dd3a2"
+            ["aom"]="3f62de0eddedb9a246d32b150d6bc47baa790282"
+            ["ngtcp2"]="c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71"
+            ["nghttp3"]="056fbdf9102c4fbc40844dd1ae83d467af31dbeb"
+            ["uavs3d"]="0e20d2c291853f196c68922a264bcd8471d75b68"
+          )
+          for pkg in "${!PIN[@]}"; do
+            d="src_packages/$pkg"; sha="${PIN[$pkg]}"
+            [ -d "$d/.git" ] || continue
+            full=$(git -C "$d" rev-parse "${sha}^{commit}" 2>/dev/null)
+            if [ -z "$full" ]; then
+              git -C "$d" fetch --depth=1 origin "$sha" 2>/dev/null || git -C "$d" fetch origin 2>/dev/null || true
               full=$(git -C "$d" rev-parse "${sha}^{commit}" 2>/dev/null)
-              if [ -z "$full" ]; then
-                git -C "$d" fetch --depth=1 origin "$sha" 2>/dev/null || git -C "$d" fetch origin 2>/dev/null || true
-                full=$(git -C "$d" rev-parse "${sha}^{commit}" 2>/dev/null)
-              fi
-              cur=$(git -C "$d" rev-parse HEAD 2>/dev/null)
-              if [ -n "$full" ] && [ "$cur" != "$full" ]; then
-                echo "LOCK-FIX $pkg: ${cur:0:10} -> ${full:0:10}"
-                git -C "$d" reset --hard "$full" && git -C "$d" clean -fdx || rm -rf "$d"
-                rm -rf "build${{ matrix.bit }}/packages/$pkg-prefix"
-              fi
-            done
-          fi
+            fi
+            cur=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+            if [ -n "$full" ] && [ "$cur" != "$full" ]; then
+              echo "LOCK-FIX $pkg: ${cur:0:10} -> ${full:0:10}"
+              git -C "$d" reset --hard "$full" && git -C "$d" clean -fdx || rm -rf "$d"
+              rm -rf "build${{ matrix.bit }}/packages/$pkg-prefix"
+            fi
+          done
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
