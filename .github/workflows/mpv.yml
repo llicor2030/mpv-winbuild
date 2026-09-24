@@ -587,7 +587,7 @@ jobs:
               try:
                   # Full commit history, filtered blobs. Needed for --before.
                   run(["git", "clone", "--bare", "--filter=blob:none", "--branch", branch, url, str(tmp / "repo.git")])
-                  sha = run(["git", "rev-list", "-n", "1", f"--before={CUTOFF}", f"refs/heads/{branch}"], cwd=tmp / "repo.git").strip()
+                  sha = run(["git", "rev-list", "-n", "1", "--first-parent", f"--before={CUTOFF}", f"refs/heads/{branch}"], cwd=tmp / "repo.git").strip()
                   if not sha:
                       raise SystemExit(f"no commit before {CUTOFF} for {url} {branch}")
                   cache[url] = sha
@@ -793,6 +793,73 @@ jobs:
               rm -rf "build${{ matrix.bit }}/packages/$pkg-prefix"
             fi
           done
+
+          # === pin branch-tracking packages to their 2026-06-18 branch tip ===
+          # The source lock above only pins recipes without GIT_TAG; these follow a
+          # branch and would otherwise build whatever is at its tip today. Values are
+          # the first-parent branch tip at 2026-06-18T00:40Z (matches the June build
+          # where known: zlib 5d005c5, ngtcp2 c8cc2c1, nghttp3 056fbdf). libsixel is
+          # excluded from "ninja update", so its GIT_RESET never applies; pin it to
+          # that commit (its branch tip a0151d9 does not compile).
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, shutil, subprocess
+          TIP = {
+              "angle-headers": "1274adab943e1a13a251c67dd46bd971950c4d23",
+              "c-ares":        "c93e50f3ebc0373fe57677523ec960f6c1cb0e15",
+              "fast_float":    "34164f547b7df3f5d794ff67e9f885c36819ebfc",
+              "fontconfig":    "ee5ee31013d2474f23768219aa4740a288ba1305",
+              "glad":          "cef3f890c450a14701407c9fe50f5fd02f7440b7",
+              "glslang":       "79ccdf92ccc69c457e958ec72172c082f77b2d85",
+              "harfbuzz":      "ce1228bf5a337ebce438ab6658f13289688dd229",
+              "libjpeg":       "25b62127312b5df12a9d3ed4a000595d796bfb78",
+              "libmysofa":     "42f3ae68825a4eb2d5593a2308c3483ebbdd8bfe",
+              "libsdl2":       "3f1534af438c993244d5aaafafe76887374deb09",
+              "libvpx":        "572f663c893499db9e7f69bb2fec821eae6b1c40",
+              "libwebp":       "add5156cb23d8c2742ced4198be578b570f50c88",
+              "luajit":        "da6ed766c44cdc11a90915af02c88851739dcbc7",
+              "nghttp3":       "056fbdf9102c4fbc40844dd1ae83d467af31dbeb",
+              "ngtcp2":        "c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71",
+              "opus":          "3da9f7a6db1c05c3996cb363a9d1931a978bf1be",
+              "rubberband":    "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+              "shaderc":       "0c40fcc31d5cf56fba33bff0b1d469c344139cd8",
+              "spirv-cross":   "146679ff8255a6068518685599d7fb8761d1b570",
+              "spirv-headers": "c63848ecf2200425511319fd8bf2c17b751e501e",
+              "spirv-tools":   "113784c9cf103b775fdadb1ef194f6b963e24a7e",
+              "subrandr":      "f1fee762b829c78d59b47f654d65d2ba6293eaa1",
+              "xxhash":        "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7",
+              "zlib":          "5d005c59dd782ac503a032aec2eba4c196dd1756",
+              "zstd":          "5233c58e6ca0b1c4c6b353ad79649191ed195bdc",
+              "libsixel":      "af12e5bc6f3f69ad83479da85ddb371420da9b17",
+          }
+          for pkg, sha in TIP.items():
+              p = Path(f"packages/{pkg}.cmake")
+              t = p.read_text()
+              tags = re.findall(r"^[ \t]*GIT_TAG[ \t]", t, re.M)
+              if len(tags) == 1:
+                  t = re.sub(r"^([ \t]*)GIT_TAG[ \t]+\S+[ \t]*$", rf"\g<1>GIT_TAG {sha}", t, flags=re.M)
+              elif not tags:
+                  t = re.sub(r"^([ \t]*)(GIT_REPOSITORY[ \t]+\S+)[ \t]*$", rf"\g<1>\g<2>\n\g<1>GIT_TAG {sha}", t, count=1, flags=re.M)
+              else:
+                  raise SystemExit(f"{p}: {len(tags)} GIT_TAG lines")
+              # commit-pinned + GIT_REMOTE_NAME makes cleanup() run "git reset --hard @{u}"
+              # on a detached HEAD (exit 128)
+              t = re.sub(r"^[ \t]*GIT_REMOTE_NAME[ \t]+origin[ \t]*\n", "", t, flags=re.M)
+              p.write_text(t)
+              if not re.search(rf"^[ \t]*GIT_TAG {sha}[ \t]*$", t, re.M) or "GIT_REMOTE_NAME" in t:
+                  raise SystemExit(f"{p}: pin not applied")
+              # a cache-restored source is not re-cloned by ExternalProject: drop it if
+              # it is not at the pinned commit
+              src = Path(f"src_packages/{pkg}")
+              if (src / ".git").exists():
+                  head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True).stdout.strip()
+                  if head != sha:
+                      print(f"TIP-RECLONE {pkg}: {head[:10]} -> {sha[:10]}")
+                      shutil.rmtree(src, ignore_errors=True)
+                      shutil.rmtree(f"build64/packages/{pkg}-prefix", ignore_errors=True)
+              print(f"TIP {pkg} -> {sha}")
+          PY
 
           bash ../wrapper/build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
       - name: Upload source lock manifest
