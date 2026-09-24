@@ -233,13 +233,19 @@ jobs:
           grep -q 'GIT_TAG' $tc/mingw-w64.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/mingw-w64\/mingw-w64.git/a\    GIT_TAG 00349888007fef589c2604bf60d0ea14c0e2d606' $tc/mingw-w64.cmake
           grep -q 'GIT_TAG' $tc/cppwinrt.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/microsoft\/cppwinrt.git/a\    GIT_TAG c4cf531f6a8ec29c0e7eb19ed817043405ba9fa7' $tc/cppwinrt.cmake
           sed -i 's|windows-rs/raw/master/|windows-rs/raw/8c4ceb46142b2c30e13f5a8688f5efe4a22838a9/|' $tc/cppwinrt.cmake
+          # A commit-pinned recipe must not keep GIT_REMOTE_NAME: cleanup() runs
+          # reset_head.sh, which then does "git reset --hard @{u}" on a detached
+          # HEAD and fails (exit 128, "HEAD does not point to a branch").
+          # expat has no GIT_TAG, so the package source lock pins it the same way.
+          sed -i '/^[[:space:]]*GIT_REMOTE_NAME origin[[:space:]]*$/d' $tc/llvm/llvm.cmake mpv-winbuild-cmake/packages/expat.cmake
           if ! grep -q 'GIT_TAG 1f5aee55a3fc' $tc/llvm/llvm.cmake ||
              ! grep -q 'GIT_TAG 00349888007f' $tc/mingw-w64.cmake ||
              ! grep -q 'GIT_TAG c4cf531f6a8e' $tc/cppwinrt.cmake ||
-             ! grep -q 'windows-rs/raw/8c4ceb46142b' $tc/cppwinrt.cmake; then
+             ! grep -q 'windows-rs/raw/8c4ceb46142b' $tc/cppwinrt.cmake ||
+             grep -q 'GIT_REMOTE_NAME' $tc/llvm/llvm.cmake mpv-winbuild-cmake/packages/expat.cmake; then
             echo "::error::toolchain pin failed"; exit 1
           fi
-          grep -n 'GIT_TAG\|windows-rs' $tc/llvm/llvm.cmake $tc/mingw-w64.cmake $tc/cppwinrt.cmake
+          grep -n 'GIT_TAG\|GIT_REMOTE_NAME\|windows-rs' $tc/llvm/llvm.cmake $tc/mingw-w64.cmake $tc/cppwinrt.cmake mpv-winbuild-cmake/packages/expat.cmake
 
 
       - name: Lookup Toolchain Cache
