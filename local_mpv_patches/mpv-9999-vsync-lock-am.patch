@@ -1,0 +1,579 @@
+From 7961c7c71af8cf80f90a600623c388166894aa2b Mon Sep 17 00:00:00 2001
+From: local <local@example.invalid>
+Date: Thu, 24 Sep 2026 06:23:30 +0000
+Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
+ display-sync feedback
+
+Win32/Vulkan had no get_vsync. mpv does not own the swapchain and there is
+no Vulkan API on Windows for past presentation timing, so display-sync ran
+without feedback: a vblank physically missed by the swapchain was invisible
+to vo.c, the A/V difference did not move, and neither drop_repeat nor the
+display-tempo audio loop corrected it; the picture stayed one vblank off.
+
+Pin down when a frame is shown instead of guessing it afterwards:
+
+- A detached watcher thread waits on the real scan-out vblank of the
+  window's monitor (D3DKMTWaitForVerticalBlankEvent, re-opened when the
+  window changes monitors) and keeps a vblank index with a smoothed
+  phase/period estimate (initial period from 30 consistent intervals, then
+  phase += 0.1*err, period += 0.002*err/n, outlier rejection, restart after
+  long gaps). It holds a module reference and exits through
+  FreeLibraryAndExitThread, so unloading libmpv cannot remove its code.
+
+- swap_buffers blocks until the first vblank after the present, so the VO
+  advances one vblank per swap. get_vsync reports that vblank's time and
+  the vblank count skipped since the previous swap. A late present lands on
+  a later vblank, the reported spacing becomes 2+ periods, vo.c's skip
+  detection fires and display-sync sees the slip in the A/V difference.
+
+With vulkan-swap-mode=mailbox and swapchain-depth=1 the mapping is exact:
+libplacebo's swap_buffers returns only after the frame's GPU work finished,
+and mailbox latches the newest ready image at the next vblank. FIFO does not
+double-wait (one image per vblank in, one per vblank out) but may show the
+image a vblank later than reported.
+
+Statistics every 10 s at -v ("vsync-lock:"): host rate, late swaps and
+skipped vblanks, present offset inside the refresh cycle, wait time,
+swaps without feedback, watcher wake-ups missed. Without the D3DKMT API, or
+until the estimate has settled, nothing is reported and vo.c keeps its
+fallback path.
+---
+ video/out/vulkan/context_win.c | 496 +++++++++++++++++++++++++++++++++
+ 1 file changed, 496 insertions(+)
+
+diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
+index 43bdcf2..7136935 100644
+--- a/video/out/vulkan/context_win.c
++++ b/video/out/vulkan/context_win.c
+@@ -15,6 +15,13 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <math.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++#include <windows.h>
++
++#include "osdep/timer.h"
+ #include "video/out/gpu/context.h"
+ #include "video/out/gpu/d3d11_helpers.h"
+ #include "video/out/w32_common.h"
+@@ -26,15 +33,500 @@
+ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+ #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
+ 
++// ---------------------------------------------------------------------------
++// Host vblank lock (presentation feedback for Win32/Vulkan)
++//
++// mpv does not own the Vulkan swapchain here and there is no Vulkan/Win32 API
++// for past presentation timing, so display-sync had no feedback on this path:
++// a vblank physically missed by the swapchain was invisible to vo.c, the A/V
++// difference did not move and neither drop_repeat nor the audio tempo loop
++// corrected it.
++//
++// Instead of guessing when a frame was shown, pin down when it is shown:
++//  - A watcher thread waits on the real scan-out vblank of the window's
++//    monitor (D3DKMTWaitForVerticalBlankEvent) and keeps a vblank index plus a
++//    smoothed phase/period estimate (phase follows quickly, period follows
++//    ppm-level drift very slowly).
++//  - After each present, swap_buffers blocks until the first vblank after the
++//    present, so the VO advances exactly one vblank per swap.
++//  - get_vsync reports that vblank's time. A late present lands on a later
++//    vblank, the reported spacing becomes 2+ periods, vo.c's skip detection
++//    fires and display-sync sees the slip in the A/V difference.
++//
++// With vulkan-swap-mode=mailbox and swapchain-depth=1 the mapping is exact:
++// libplacebo's swap_buffers returns only after the frame's GPU work finished,
++// and mailbox latches the newest ready image at the next vblank. With FIFO the
++// wait does not double up (FIFO consumes one image per vblank, we submit one per
++// vblank), but the image may reach the screen a vblank later than reported.
++//
++// Only the timing is taken from the host; nothing is changed about what is
++// rendered. If the vblank API is unavailable or the estimate is not settled,
++// no feedback is reported and vo.c keeps its fallback behaviour.
++// ---------------------------------------------------------------------------
++
++// D3DKMT (gdi32.dll exports), declared locally to avoid depending on
++// d3dkmthk.h. D3DKMT_HANDLE is a UINT.
++struct vbl_kmt_open {
++    HDC hDc;
++    UINT hAdapter;
++    LUID AdapterLuid;
++    UINT VidPnSourceId;
++};
++
++struct vbl_kmt_wait {
++    UINT hAdapter;
++    UINT hDevice;
++    UINT VidPnSourceId;
++};
++
++struct vbl_kmt_close {
++    UINT hAdapter;
++};
++
++typedef LONG (APIENTRY *vbl_open_fn)(struct vbl_kmt_open *);
++typedef LONG (APIENTRY *vbl_wait_fn)(const struct vbl_kmt_wait *);
++typedef LONG (APIENTRY *vbl_close_fn)(const struct vbl_kmt_close *);
++
++#define VBL_NS_PER_MS 1e6
++
++// Host vblank estimate. Times are mp_time_ns() values held as double.
++struct vbl_est {
++    uint64_t seq;       // index of the vblank at `phase`
++    double phase;       // estimated time of vblank #seq
++    double period;      // estimated refresh period, 0 while unknown
++    double last_wake;   // time of the most recent watcher wake-up
++    unsigned samples;   // accepted vblanks since the period became known
++    unsigned epoch;     // bumped whenever the estimate is restarted
++    uint64_t missed;    // vblanks the watcher itself slept through
++
++    double init_first, init_prev;
++    unsigned init_count;
++    unsigned outliers;
++};
++
++static void vbl_est_restart(struct vbl_est *e)
++{
++    e->period = 0;
++    e->samples = 0;
++    e->init_count = 0;
++    e->outliers = 0;
++    e->epoch++;
++}
++
++// Same estimator as shadPS4's VsyncLock: initial period from 30 consistent
++// intervals, then phase += 0.1*err, period += 0.002*err/n, outlier rejection,
++// and a restart after a long gap (display off, mode change).
++static void vbl_est_on_vblank(struct vbl_est *e, double t)
++{
++    e->last_wake = t;
++
++    if (e->period <= 0) {
++        // Rate unknown: count wake-ups so the index keeps moving forward.
++        e->seq++;
++        e->phase = t;
++        if (e->init_count == 0) {
++            e->init_first = e->init_prev = t;
++            e->init_count = 1;
++            return;
++        }
++        double dt = t - e->init_prev;
++        e->init_prev = t;
++        if (dt < 2 * VBL_NS_PER_MS || dt > 110 * VBL_NS_PER_MS) {
++            e->init_count = 0; // missed or spurious vblank, start over
++            return;
++        }
++        if (e->init_count >= 2) {
++            double mean = (e->init_prev - dt - e->init_first) / (e->init_count - 1);
++            if (fabs(dt - mean) > mean * 0.1) {
++                e->init_count = 0;
++                return;
++            }
++        }
++        if (++e->init_count > 30) {
++            e->period = (t - e->init_first) / (e->init_count - 1);
++            e->phase = t;
++            e->samples = 0;
++            e->outliers = 0;
++        }
++        return;
++    }
++
++    double since = t - e->phase;
++    if (since < e->period * 0.5)
++        return; // duplicate wake-up
++    double n = round(since / e->period);
++    if (n > 120) {
++        vbl_est_restart(e);
++        e->seq++;
++        e->phase = t;
++        e->init_first = e->init_prev = t;
++        e->init_count = 1;
++        return;
++    }
++    double predicted = e->phase + n * e->period;
++    double err = t - predicted;
++    if (fabs(err) > e->period * 0.25) {
++        if (++e->outliers > 8)
++            vbl_est_restart(e);
++        return;
++    }
++    e->outliers = 0;
++    e->phase = predicted + 0.1 * err;
++    e->period += 0.002 * err / n;
++    e->seq += (uint64_t)n;
++    if (n > 1)
++        e->missed += (uint64_t)n - 1;
++    e->samples++;
++}
++
++static bool vbl_est_valid(const struct vbl_est *e, double now)
++{
++    return e->period > 0 && e->samples >= 30 &&
++           now - e->last_wake < 250 * VBL_NS_PER_MS;
++}
++
++// State shared between the VO thread and the watcher thread. The watcher
++// blocks in a kernel wait that cannot be interrupted, so it is detached: it
++// holds its own reference (freed by the last owner) and a reference on this
++// module, released with FreeLibraryAndExitThread, so a libmpv unload cannot pull
++// the code out from under it.
++struct vbl_shared {
++    CRITICAL_SECTION lock;
++    CONDITION_VARIABLE cond;
++    volatile LONG refs;
++    volatile LONG stop;
++    HWND hwnd;
++    HMODULE module;
++    vbl_open_fn kmt_open;
++    vbl_wait_fn kmt_wait;
++    vbl_close_fn kmt_close;
++    struct vbl_est est; // protected by lock
++};
++
++static const char vbl_module_anchor = 0;
++
++static void vbl_unref(struct vbl_shared *s)
++{
++    if (InterlockedDecrement(&s->refs) == 0) {
++        DeleteCriticalSection(&s->lock);
++        free(s);
++    }
++}
++
++static void vbl_restart(struct vbl_shared *s)
++{
++    EnterCriticalSection(&s->lock);
++    vbl_est_restart(&s->est);
++    LeaveCriticalSection(&s->lock);
++    WakeAllConditionVariable(&s->cond);
++}
++
++static DWORD WINAPI vbl_thread(void *arg)
++{
++    struct vbl_shared *s = arg;
++    HMODULE module = s->module;
++
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++
++    HMONITOR monitor = NULL;
++    bool have_adapter = false;
++    struct vbl_kmt_wait wait_args = {0};
++    int64_t last_check = 0;
++
++    while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
++        int64_t now = mp_time_ns();
++        if (!have_adapter || now - last_check >= 1000000000) {
++            last_check = now;
++            HMONITOR cur = MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTONEAREST);
++            if (cur != monitor || !have_adapter) {
++                if (have_adapter) {
++                    struct vbl_kmt_close close_args = { wait_args.hAdapter };
++                    s->kmt_close(&close_args);
++                    have_adapter = false;
++                }
++                vbl_restart(s);
++                monitor = cur;
++
++                MONITORINFOEXW info = { .cbSize = sizeof(info) };
++                if (cur && GetMonitorInfoW(cur, (MONITORINFO *)&info)) {
++                    HDC dc = CreateDCW(NULL, info.szDevice, NULL, NULL);
++                    if (dc) {
++                        struct vbl_kmt_open open_args = { .hDc = dc };
++                        if (s->kmt_open(&open_args) == 0) {
++                            wait_args.hAdapter = open_args.hAdapter;
++                            wait_args.hDevice = 0;
++                            wait_args.VidPnSourceId = open_args.VidPnSourceId;
++                            have_adapter = true;
++                        }
++                        DeleteDC(dc);
++                    }
++                }
++                if (!have_adapter) {
++                    Sleep(1000);
++                    continue;
++                }
++            }
++        }
++
++        if (s->kmt_wait(&wait_args) != 0) {
++            struct vbl_kmt_close close_args = { wait_args.hAdapter };
++            s->kmt_close(&close_args);
++            have_adapter = false;
++            vbl_restart(s);
++            Sleep(100);
++            continue;
++        }
++
++        double t = (double)mp_time_ns();
++        EnterCriticalSection(&s->lock);
++        vbl_est_on_vblank(&s->est, t);
++        LeaveCriticalSection(&s->lock);
++        WakeAllConditionVariable(&s->cond);
++    }
++
++    if (have_adapter) {
++        struct vbl_kmt_close close_args = { wait_args.hAdapter };
++        s->kmt_close(&close_args);
++    }
++    vbl_unref(s);
++    FreeLibraryAndExitThread(module, 0);
++    return 0;
++}
++
++static struct vbl_shared *vbl_start(struct ra_ctx *ctx, HWND hwnd)
++{
++    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
++    if (!gdi)
++        gdi = LoadLibraryW(L"gdi32.dll");
++    if (!gdi)
++        return NULL;
++
++    vbl_open_fn kmt_open = (vbl_open_fn)(void (*)(void))
++        GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc");
++    vbl_wait_fn kmt_wait = (vbl_wait_fn)(void (*)(void))
++        GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent");
++    vbl_close_fn kmt_close = (vbl_close_fn)(void (*)(void))
++        GetProcAddress(gdi, "D3DKMTCloseAdapter");
++    if (!kmt_open || !kmt_wait || !kmt_close) {
++        MP_VERBOSE(ctx, "vsync-lock: D3DKMT vblank API unavailable\n");
++        return NULL;
++    }
++
++    struct vbl_shared *s = calloc(1, sizeof(*s));
++    if (!s)
++        return NULL;
++    InitializeCriticalSection(&s->lock);
++    InitializeConditionVariable(&s->cond);
++    s->refs = 2; // VO + watcher
++    s->hwnd = hwnd;
++    s->kmt_open = kmt_open;
++    s->kmt_wait = kmt_wait;
++    s->kmt_close = kmt_close;
++
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
++                            (LPCWSTR)&vbl_module_anchor, &s->module))
++    {
++        DeleteCriticalSection(&s->lock);
++        free(s);
++        return NULL;
++    }
++
++    HANDLE thread = CreateThread(NULL, 0, vbl_thread, s, 0, NULL);
++    if (!thread) {
++        FreeLibrary(s->module);
++        DeleteCriticalSection(&s->lock);
++        free(s);
++        return NULL;
++    }
++    CloseHandle(thread);
++
++    MP_VERBOSE(ctx, "vsync-lock: watching host vblank\n");
++    return s;
++}
++
++static void vbl_stop(struct vbl_shared *s)
++{
++    if (!s)
++        return;
++    InterlockedExchange(&s->stop, 1);
++    WakeAllConditionVariable(&s->cond);
++    vbl_unref(s);
++}
++
+ struct priv {
+     struct mpvk_ctx vk;
+     struct mp_dxgi_factory_ctx dxgi_ctx;
++
++    // Host vblank lock (see above). VO thread only.
++    struct vbl_shared *vbl;
++    unsigned vbl_epoch;
++    bool vbl_have_prev;
++    uint64_t vbl_prev_target;
++    bool vbl_reported_active;
++
++    // Feedback for the swap that just finished.
++    bool fb_valid;
++    int64_t fb_time;
++    int64_t fb_period;
++    int64_t fb_skipped;
++
++    // Statistics, logged every 10 seconds.
++    int64_t st_begin;
++    unsigned st_frames, st_late, st_nofb, st_timeouts;
++    uint64_t st_skipped, st_missed_base;
++    double st_off_sum, st_off_max, st_wait_sum, st_wait_max, st_period;
+ };
+ 
++static void vbl_log_stats(struct ra_ctx *ctx, int64_t now, uint64_t missed)
++{
++    struct priv *p = ctx->priv;
++    if (!p->st_begin) {
++        p->st_begin = now;
++        p->st_missed_base = missed;
++        return;
++    }
++    if (now - p->st_begin < 10000000000LL)
++        return;
++    unsigned n = p->st_frames ? p->st_frames : 1;
++    MP_VERBOSE(ctx, "vsync-lock: host %.5f Hz, frames %u, late %u (vblanks skipped %llu), "
++               "present offset mean %.2f ms max %.2f ms, wait mean %.2f ms max %.2f ms, "
++               "no-feedback %u, timeouts %u, watcher missed %llu\n",
++               p->st_period > 0 ? 1e9 / p->st_period : 0.0, p->st_frames, p->st_late,
++               (unsigned long long)p->st_skipped,
++               p->st_off_sum / n / VBL_NS_PER_MS, p->st_off_max / VBL_NS_PER_MS,
++               p->st_wait_sum / n / VBL_NS_PER_MS, p->st_wait_max / VBL_NS_PER_MS,
++               p->st_nofb, p->st_timeouts,
++               (unsigned long long)(missed - p->st_missed_base));
++    p->st_begin = now;
++    p->st_missed_base = missed;
++    p->st_frames = p->st_late = p->st_nofb = p->st_timeouts = 0;
++    p->st_skipped = 0;
++    p->st_off_sum = p->st_off_max = p->st_wait_sum = p->st_wait_max = 0;
++}
++
++static void win_swap_buffers(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    struct vbl_shared *s = p->vbl;
++
++    p->fb_valid = false;
++    if (!s)
++        return;
++
++    int64_t arrive = mp_time_ns();
++    EnterCriticalSection(&s->lock);
++    struct vbl_est *e = &s->est;
++
++    if (!vbl_est_valid(e, (double)arrive)) {
++        uint64_t missed = e->missed;
++        LeaveCriticalSection(&s->lock);
++        if (p->vbl_reported_active) {
++            MP_VERBOSE(ctx, "vsync-lock: feedback lost\n");
++            p->vbl_reported_active = false;
++        }
++        p->vbl_have_prev = false;
++        p->st_nofb++;
++        vbl_log_stats(ctx, arrive, missed);
++        return;
++    }
++
++    if (e->epoch != p->vbl_epoch) {
++        p->vbl_epoch = e->epoch;
++        p->vbl_have_prev = false;
++    }
++
++    // The vblank interval the present was submitted in, and the first vblank
++    // after it: that is where this frame is latched.
++    double period = e->period;
++    double since = (double)arrive - e->phase;
++    int64_t k = (int64_t)floor(since / period);
++    uint64_t cur = (uint64_t)((int64_t)e->seq + k);
++    double offset = since - (double)k * period; // time since vblank #cur
++    uint64_t target = cur + 1;
++    // The watcher already woke for vblank #seq before we got here, so that one
++    // is definitely in the past even if the smoothed phase says otherwise.
++    if ((double)arrive >= e->last_wake && target <= e->seq)
++        target = e->seq + 1;
++    if (p->vbl_have_prev && target <= p->vbl_prev_target)
++        target = p->vbl_prev_target + 1;
++
++    // Pace the VO: one vblank per swap. Wait for the watcher to see #target.
++    unsigned epoch = e->epoch;
++    int64_t limit = arrive + (int64_t)((double)(target - cur) * period + 2 * period);
++    bool timed_out = false;
++    while (e->seq < target && e->epoch == epoch &&
++           !InterlockedCompareExchange(&s->stop, 0, 0))
++    {
++        int64_t now = mp_time_ns();
++        if (now >= limit) {
++            timed_out = true;
++            break;
++        }
++        DWORD ms = (DWORD)((limit - now) / 1000000) + 1;
++        SleepConditionVariableCS(&s->cond, &s->lock, ms);
++    }
++
++    bool ok = !timed_out && e->epoch == epoch && e->seq >= target && e->period > 0;
++    double shown = ok ? e->phase - (double)(e->seq - target) * e->period : 0;
++    double cur_period = e->period;
++    uint64_t missed = e->missed;
++    LeaveCriticalSection(&s->lock);
++
++    int64_t done = mp_time_ns();
++    if (!ok) {
++        p->vbl_have_prev = false;
++        if (timed_out)
++            p->st_timeouts++;
++        p->st_nofb++;
++        vbl_log_stats(ctx, done, missed);
++        return;
++    }
++
++    int64_t skipped = p->vbl_have_prev ? (int64_t)(target - p->vbl_prev_target) - 1 : 0;
++    p->vbl_prev_target = target;
++    p->vbl_have_prev = true;
++
++    p->fb_valid = true;
++    p->fb_time = llrint(shown);
++    p->fb_period = llrint(cur_period);
++    p->fb_skipped = skipped;
++
++    if (!p->vbl_reported_active) {
++        MP_VERBOSE(ctx, "vsync-lock: feedback active, host %.5f Hz\n", 1e9 / cur_period);
++        p->vbl_reported_active = true;
++    }
++
++    double wait = (double)(done - arrive);
++    p->st_frames++;
++    if (skipped > 0) {
++        p->st_late++;
++        p->st_skipped += (uint64_t)skipped;
++    }
++    p->st_off_sum += offset;
++    p->st_off_max = MPMAX(p->st_off_max, offset);
++    p->st_wait_sum += wait;
++    p->st_wait_max = MPMAX(p->st_wait_max, wait);
++    p->st_period = cur_period;
++    vbl_log_stats(ctx, done, missed);
++}
++
++static void win_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    struct priv *p = ctx->priv;
++    if (!p->fb_valid)
++        return;
++    info->vsync_duration = p->fb_period;
++    info->skipped_vsyncs = p->fb_skipped;
++    info->last_queue_display_time = p->fb_time;
++}
++
+ static void win_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+ 
++    vbl_stop(p->vbl);
++    p->vbl = NULL;
++
+     ra_vk_ctx_uninit(ctx);
+     mpvk_uninit(&p->vk);
+     vo_w32_uninit(ctx->vo);
+@@ -84,9 +576,13 @@ static bool win_init(struct ra_ctx *ctx)
+          .hwnd = vo_w32_hwnd(ctx->vo),
+     };
+ 
++    p->vbl = vbl_start(ctx, vo_w32_hwnd(ctx->vo));
++
+     struct ra_ctx_params params = {
+         .color_depth = color_depth,
+         .preferred_csp = preferred_csp,
++        .swap_buffers = p->vbl ? win_swap_buffers : NULL,
++        .get_vsync = p->vbl ? win_get_vsync : NULL,
+     };
+ 
+     VkInstance inst = vk->vkinst->instance;
+-- 
+2.43.0
+
