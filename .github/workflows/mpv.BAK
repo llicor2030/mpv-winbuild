@@ -246,19 +246,6 @@ jobs:
             echo "::error::toolchain pin failed"; exit 1
           fi
           grep -n 'GIT_TAG\|GIT_REMOTE_NAME\|windows-rs' $tc/llvm/llvm.cmake $tc/mingw-w64.cmake $tc/cppwinrt.cmake mpv-winbuild-cmake/packages/expat.cmake
-          # Vulkan-Loader and Vulkan-Headers follow main; the loader patch was
-          # rebased for the June loader and conflicts with later ones. Pin the
-          # 2026-06-18 pair (both 1.4.354); drop GIT_REMOTE_NAME as above.
-          pk=mpv-winbuild-cmake/packages
-          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG b52703d439c3077705db64e61c186545ddfdb2c7|' $pk/vulkan.cmake
-          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG 01393c3df0e5285b54ee6527466513f9e614be94|' $pk/vulkan-header.cmake
-          sed -i '/^[[:space:]]*GIT_REMOTE_NAME origin[[:space:]]*$/d' $pk/vulkan.cmake $pk/vulkan-header.cmake
-          if ! grep -q 'GIT_TAG b52703d439c3' $pk/vulkan.cmake ||
-             ! grep -q 'GIT_TAG 01393c3df0e5' $pk/vulkan-header.cmake ||
-             grep -q 'GIT_REMOTE_NAME' $pk/vulkan.cmake $pk/vulkan-header.cmake; then
-            echo "::error::vulkan pin failed"; exit 1
-          fi
-          grep -n 'GIT_TAG\|GIT_REMOTE_NAME' $pk/vulkan.cmake $pk/vulkan-header.cmake
 
 
       - name: Lookup Toolchain Cache
