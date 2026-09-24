@@ -225,6 +225,22 @@ jobs:
           echo "cache_suffix=$(date "+%Y-%m-%d")-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
+          # Pin toolchain sources to the 2026-06-18 build. The package source lock
+          # only covers packages/*.cmake; toolchain/ followed moving branches, and
+          # windows-rs moved Windows.winmd on 2026-08-04 (404 in cppwinrt install).
+          tc=mpv-winbuild-cmake/toolchain
+          sed -i 's|GIT_TAG release/22.x|GIT_TAG 1f5aee55a3fc26c87fc689011053d8069dd3d849|' $tc/llvm/llvm.cmake
+          grep -q 'GIT_TAG' $tc/mingw-w64.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/mingw-w64\/mingw-w64.git/a\    GIT_TAG 00349888007fef589c2604bf60d0ea14c0e2d606' $tc/mingw-w64.cmake
+          grep -q 'GIT_TAG' $tc/cppwinrt.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/microsoft\/cppwinrt.git/a\    GIT_TAG c4cf531f6a8ec29c0e7eb19ed817043405ba9fa7' $tc/cppwinrt.cmake
+          sed -i 's|windows-rs/raw/master/|windows-rs/raw/8c4ceb46142b2c30e13f5a8688f5efe4a22838a9/|' $tc/cppwinrt.cmake
+          if ! grep -q 'GIT_TAG 1f5aee55a3fc' $tc/llvm/llvm.cmake ||
+             ! grep -q 'GIT_TAG 00349888007f' $tc/mingw-w64.cmake ||
+             ! grep -q 'GIT_TAG c4cf531f6a8e' $tc/cppwinrt.cmake ||
+             ! grep -q 'windows-rs/raw/8c4ceb46142b' $tc/cppwinrt.cmake; then
+            echo "::error::toolchain pin failed"; exit 1
+          fi
+          grep -n 'GIT_TAG\|windows-rs' $tc/llvm/llvm.cmake $tc/mingw-w64.cmake $tc/cppwinrt.cmake
+
 
       - name: Lookup Toolchain Cache
         id: lookup_toolchain
