@@ -1,4 +1,4 @@
-From 7745d9e1726662b28044ee2de2f8792cee82f9de Mon Sep 17 00:00:00 2001
+From b2cbfa4038e998550d75dda1ebd1a55e5d1fdf20 Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
 Date: Thu, 24 Sep 2026 06:23:30 +0000
 Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
@@ -42,8 +42,9 @@ MPV_VSYNC_LOCK selects how much of the lock runs, to isolate its effects
 inside one build: 0 off, 1 watcher thread only, 2 watcher + swap_buffers
 pacing without feedback, 3 (default) watcher + pacing + feedback,
 4 watcher + pre-render pacing without feedback, 5 watcher + pre-render
-pacing + feedback, 7 present phase lock + feedback. The chosen mode is
-logged once at info level ("vsync-lock: MPV_VSYNC_LOCK=").
+pacing + feedback, 7 present phase lock + feedback, 8 present phase lock
+of the present only + feedback. The chosen mode is logged once at info level
+("vsync-lock: MPV_VSYNC_LOCK=").
 
 Pre-render pacing moves the wait from the end of swap_buffers to the start
 of the next frame (the check_visible hook at the top of draw_frame, before
@@ -75,12 +76,97 @@ shows that it was not replaced, the next report carries the real position.
 Intervals dropped by the timer (slots without a new image) are reported as
 skipped vblanks. Statistics every 10 s also give the lock state and the
 phase error ("vsync-lock: host ... Hz, locked, phase err mean ...").
----
- video/out/vulkan/context_win.c | 1041 ++++++++++++++++++++++++++++++++
- 1 file changed, 1041 insertions(+)
 
+Mode 8 keeps mode 7's timer and phase lock but holds back only the present,
+which is what shadPS4's present thread does: its guest renders on its own and
+only the flip waits for the timer. Pacing the whole VO iteration (modes 2-5
+and 7) also moves the core wake-up that vo.c issues right before draw_frame,
+and with it the filter chain (e.g. GPU upscaler inference), so the GPU work
+of the pipeline gets interleaved differently than without the lock. In mode 8
+rendering runs as without the lock and only the finished image waits for its
+slot. For that, a pre_present hook (ra_ctx_params / ra_swapchain_fns) is
+called right before the present: from vo_gpu_next's flip_page before
+pl_swapchain_submit_frame (the rendering has already been flushed to the GPU
+by pl_gpu_flush at the end of draw_frame), and from the Vulkan context's
+submit_frame for vo_gpu. Contexts that do not set the hook are unaffected.
+---
+ video/out/gpu/context.h        |    8 +
+ video/out/vo_gpu_next.c        |    2 +
+ video/out/vulkan/context.c     |    9 +
+ video/out/vulkan/context_win.c | 1061 ++++++++++++++++++++++++++++++++
+ 4 files changed, 1080 insertions(+)
+
+diff --git a/video/out/gpu/context.h b/video/out/gpu/context.h
+index 6c5d008..7c747e8 100644
+--- a/video/out/gpu/context.h
++++ b/video/out/gpu/context.h
+@@ -88,6 +88,9 @@ struct ra_ctx_params {
+     // ra_gl_ctx_swap_buffers. Required unless you either never call that
+     // function or if you override it yourself.
+     void (*swap_buffers)(struct ra_ctx *ctx);
++
++    // See ra_swapchain_fns.pre_present. Optional.
++    void (*pre_present)(struct ra_ctx *ctx);
+ };
+ 
+ // Extra struct for the swapchain-related functions so they can be easily
+@@ -130,6 +133,11 @@ struct ra_swapchain_fns {
+     // swapchains smart enough to do something with it.
+     bool (*submit_frame)(struct ra_swapchain *sw, const struct vo_frame *frame);
+ 
++    // Called right before a rendered frame is presented, after its rendering
++    // commands have been flushed to the GPU. Lets the context decide when the
++    // present happens without holding back the rendering. Optional.
++    void (*pre_present)(struct ra_swapchain *sw);
++
+     // Performs a buffer swap. This blocks for as long as necessary to meet
+     // params.swapchain_depth, or until the next vblank (for vsynced contexts)
+     void (*swap_buffers)(struct ra_swapchain *sw);
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 308a9fb..ea27156 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1514,6 +1514,8 @@ static void flip_page(struct vo *vo)
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+ 
+     if (p->frame_pending) {
++        if (sw->fns->pre_present)
++            sw->fns->pre_present(sw);
+         if (!pl_swapchain_submit_frame(p->sw))
+             MP_ERR(vo, "Failed presenting frame!\n");
+         p->frame_pending = false;
+diff --git a/video/out/vulkan/context.c b/video/out/vulkan/context.c
+index d062ea8..8c2fd81 100644
+--- a/video/out/vulkan/context.c
++++ b/video/out/vulkan/context.c
+@@ -522,9 +522,17 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
+     return true;
+ }
+ 
++static void pre_present(struct ra_swapchain *sw)
++{
++    struct priv *p = sw->priv;
++    if (p->params.pre_present)
++        p->params.pre_present(sw->ctx);
++}
++
+ static bool submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
+ {
+     struct priv *p = sw->priv;
++    pre_present(sw);
+     return pl_swapchain_submit_frame(p->vk->swapchain);
+ }
+ 
+@@ -589,6 +597,7 @@ static const struct ra_swapchain_fns vulkan_swapchain = {
+     .target_csp    = target_csp,
+     .start_frame   = start_frame,
+     .submit_frame  = submit_frame,
++    .pre_present   = pre_present,
+     .swap_buffers  = swap_buffers,
+     .get_vsync     = get_vsync,
+ };
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..f508c63 100644
+index 43bdcf2..67cc2d8 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,6 +15,13 @@
@@ -97,7 +183,7 @@ index 43bdcf2..f508c63 100644
  #include "video/out/gpu/context.h"
  #include "video/out/gpu/d3d11_helpers.h"
  #include "video/out/w32_common.h"
-@@ -26,15 +33,1015 @@
+@@ -26,15 +33,1033 @@
  EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
  
@@ -624,7 +710,7 @@ index 43bdcf2..f508c63 100644
 +               p->st_wait_sum / n / VBL_NS_PER_MS, p->st_wait_max / VBL_NS_PER_MS,
 +               p->st_nofb, p->st_timeouts,
 +               (unsigned long long)(missed - p->st_missed_base));
-+    if (p->vbl_mode == 7) {
++    if (p->vbl_mode == 7 || p->vbl_mode == 8) {
 +        unsigned m = p->st_pll_n ? p->st_pll_n : 1;
 +        MP_VERBOSE(ctx, "vsync-lock: host %.5f Hz, %s, phase err mean %+.3f ms, max %.3f ms "
 +                   "(margin %.2f ms)\n",
@@ -907,16 +993,17 @@ index 43bdcf2..f508c63 100644
 +    Sleep((DWORD)(ns / VBL_NS_PER_MS));
 +}
 +
-+// Mode 7, top of draw_frame: AccurateTimer::End() for the previous frame,
-+// AccurateTimer::Start() (sleep off the slack) and SetTargetInterval(
-+// VsyncLock::NextInterval()) for this one. Without a settled host vblank
-+// estimate the timer is stopped and the VO runs as without the lock.
-+static bool win_check_visible_pll(struct ra_ctx *ctx)
++// One iteration of shadPS4's present loop: AccurateTimer::End() for the
++// previous iteration, AccurateTimer::Start() (sleep off the slack) and
++// SetTargetInterval(VsyncLock::NextInterval()) for this one. Without a settled
++// host vblank estimate the timer is stopped and nothing is held back.
++// Mode 7 runs it at the top of draw_frame, mode 8 right before the present.
++static void vbl_pll_tick(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
 +    struct vbl_shared *s = p->vbl;
 +    if (!s)
-+        return true;
++        return;
 +    struct vbl_pll *pl = &p->pll;
 +
 +    double now = (double)mp_time_ns();
@@ -930,7 +1017,7 @@ index 43bdcf2..f508c63 100644
 +        if (pl->locked)
 +            MP_VERBOSE(ctx, "vsync-lock: lost (no host vblank)\n");
 +        vbl_pll_reset(pl);
-+        return true;
++        return;
 +    }
 +
 +    vbl_pll_timer_end(pl, now);
@@ -944,7 +1031,22 @@ index 43bdcf2..f508c63 100644
 +    double wait = pl->start - begin;
 +    p->st_wait_sum += wait;
 +    p->st_wait_max = MPMAX(p->st_wait_max, wait);
++}
++
++// Mode 7: the timer paces the whole VO iteration (it holds back rendering).
++static bool win_check_visible_pll(struct ra_ctx *ctx)
++{
++    vbl_pll_tick(ctx);
 +    return true;
++}
++
++// Mode 8: the timer holds back only the present. Rendering, and with it the
++// core wake-up and the filter chain that vo.c triggers right before
++// draw_frame, run exactly as without the lock; the finished image waits for
++// its slot, like a flip request in shadPS4's present thread.
++static void win_pre_present_pll(struct ra_ctx *ctx)
++{
++    vbl_pll_tick(ctx);
 +}
 +
 +// Mode 7, after the present: measure the phase for the lock and report the
@@ -1077,6 +1179,8 @@ index 43bdcf2..f508c63 100644
 +//      a timer before each frame, trimmed so that the present lands
 +//      MPV_VSYNC_LOCK_MARGIN_MS before the host vblank; nothing waits for
 +//      the vblank itself
++//   8  as 7, but the timer holds back only the present, not the rendering
++//      (the structure of shadPS4's present thread)
 +static int vbl_get_mode(void)
 +{
 +    const char *env = getenv("MPV_VSYNC_LOCK");
@@ -1084,7 +1188,7 @@ index 43bdcf2..f508c63 100644
 +        return 3;
 +    char *end = NULL;
 +    long v = strtol(env, &end, 10);
-+    if (end == env || *end || v < 0 || v > 7 || v == 6)
++    if (end == env || *end || v < 0 || v > 8 || v == 6)
 +        return 3;
 +    return (int)v;
 +}
@@ -1113,7 +1217,7 @@ index 43bdcf2..f508c63 100644
      ra_vk_ctx_uninit(ctx);
      mpvk_uninit(&p->vk);
      vo_w32_uninit(ctx->vo);
-@@ -84,9 +1091,43 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -84,9 +1109,45 @@ static bool win_init(struct ra_ctx *ctx)
           .hwnd = vo_w32_hwnd(ctx->vo),
      };
  
@@ -1123,10 +1227,11 @@ index 43bdcf2..f508c63 100644
 +        "off", "watcher only", "watcher + pacing", "watcher + pacing + feedback",
 +        "watcher + pre-render pacing", "watcher + pre-render pacing + feedback",
 +        "(unused)", "present phase lock + feedback",
++        "present phase lock (present only) + feedback",
 +    };
 +    bool vbl_pre = p->vbl_mode == 4 || p->vbl_mode == 5;
-+    bool vbl_pll = p->vbl_mode == 7;
-+    bool vbl_fb = p->vbl_mode == 3 || p->vbl_mode == 5 || p->vbl_mode == 7;
++    bool vbl_pll = p->vbl_mode == 7 || p->vbl_mode == 8;
++    bool vbl_fb = p->vbl_mode == 3 || p->vbl_mode == 5 || vbl_pll;
 +    if (p->vbl && vbl_pll) {
 +        p->pll.margin = vbl_get_margin();
 +        p->pll_timer = CreateWaitableTimerExW(NULL, NULL,
@@ -1148,8 +1253,9 @@ index 43bdcf2..f508c63 100644
          .color_depth = color_depth,
          .preferred_csp = preferred_csp,
 +        .check_visible = !p->vbl ? NULL
-+                         : vbl_pll ? win_check_visible_pll
++                         : p->vbl_mode == 7 ? win_check_visible_pll
 +                         : vbl_pre ? win_check_visible : NULL,
++        .pre_present = p->vbl && p->vbl_mode == 8 ? win_pre_present_pll : NULL,
 +        .swap_buffers = !p->vbl || p->vbl_mode < 2 ? NULL
 +                        : vbl_pll ? win_swap_buffers_pll
 +                        : vbl_pre ? win_swap_buffers_pre : win_swap_buffers,
