@@ -1,4 +1,4 @@
-From 50d4f608b6ca71513e23ee412e820acc36871b4a Mon Sep 17 00:00:00 2001
+From 7ba0d46b17b7969e32291b15dfaa79674e1fc4e0 Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
 Date: Thu, 24 Sep 2026 06:23:30 +0000
 Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
@@ -40,14 +40,25 @@ fallback path.
 
 MPV_VSYNC_LOCK selects how much of the lock runs, to isolate its effects
 inside one build: 0 off, 1 watcher thread only, 2 watcher + swap_buffers
-pacing without feedback, 3 (default) watcher + pacing + feedback. The
-chosen mode is logged once at info level ("vsync-lock: MPV_VSYNC_LOCK=").
+pacing without feedback, 3 (default) watcher + pacing + feedback,
+4 watcher + pre-render pacing without feedback, 5 watcher + pre-render
+pacing + feedback. The chosen mode is logged once at info level
+("vsync-lock: MPV_VSYNC_LOCK=").
+
+Pre-render pacing moves the wait from the end of swap_buffers to the start
+of the next frame (the check_visible hook at the top of draw_frame, before
+the image is acquired). vo.c wakes the core right before draw_frame, so with
+the wait at the end of swap_buffers the core's filter chain (e.g. GPU
+upscaler inference) and the VO's rendering start together right after every
+vblank; with the wait before rendering the core is woken right after the
+present instead. Frames are rendered, presented and reported at the same
+vblanks in both variants.
 ---
- video/out/vulkan/context_win.c | 529 +++++++++++++++++++++++++++++++++
- 1 file changed, 529 insertions(+)
+ video/out/vulkan/context_win.c | 675 +++++++++++++++++++++++++++++++++
+ 1 file changed, 675 insertions(+)
 
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..d28fc1e 100644
+index 43bdcf2..019533c 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,6 +15,13 @@
@@ -64,7 +75,7 @@ index 43bdcf2..d28fc1e 100644
  #include "video/out/gpu/context.h"
  #include "video/out/gpu/d3d11_helpers.h"
  #include "video/out/w32_common.h"
-@@ -26,15 +33,526 @@
+@@ -26,15 +33,667 @@
  EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
  
@@ -400,6 +411,13 @@ index 43bdcf2..d28fc1e 100644
 +    uint64_t vbl_prev_target;
 +    bool vbl_reported_active;
 +
++    // Pre-render pacing (modes 4, 5): the vblank the last present targets.
++    // The wait for it happens at the start of the next frame.
++    bool pend_valid;
++    uint64_t pend_target;
++    unsigned pend_epoch;
++    int64_t pend_limit;
++
 +    // Feedback for the swap that just finished.
 +    bool fb_valid;
 +    int64_t fb_time;
@@ -528,7 +546,7 @@ index 43bdcf2..d28fc1e 100644
 +    p->fb_skipped = skipped;
 +
 +    if (!p->vbl_reported_active) {
-+        if (p->vbl_mode >= 3) {
++        if (p->vbl_mode == 3) {
 +            MP_VERBOSE(ctx, "vsync-lock: feedback active, host %.5f Hz\n", 1e9 / cur_period);
 +        } else {
 +            MP_VERBOSE(ctx, "vsync-lock: pacing active (feedback not reported), "
@@ -551,6 +569,137 @@ index 43bdcf2..d28fc1e 100644
 +    vbl_log_stats(ctx, done, missed);
 +}
 +
++// Pre-render pacing (modes 4, 5). swap_buffers only decides which vblank the
++// present lands on and does not wait. The wait for that vblank is done at the
++// start of the next frame (check_visible runs at the top of draw_frame, before
++// the swapchain image is acquired and before any rendering or upload).
++//
++// vo.c wakes the core (which pulls the next frame through the filter chain,
++// e.g. an upscaler's GPU inference) right before draw_frame. With the wait at
++// the end of swap_buffers that wake-up and the next frame's rendering happen
++// back to back right after every vblank, so both GPU workloads start at the
++// same moment. With the wait here, the wake-up happens right after the
++// present and the filter chain gets the rest of the refresh cycle before the
++// VO renders again. The frames are rendered and presented at the same
++// vblanks either way.
++static void win_swap_buffers_pre(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    struct vbl_shared *s = p->vbl;
++
++    p->fb_valid = false;
++    p->pend_valid = false;
++    if (!s)
++        return;
++
++    int64_t arrive = mp_time_ns();
++    EnterCriticalSection(&s->lock);
++    struct vbl_est *e = &s->est;
++
++    if (!vbl_est_valid(e, (double)arrive)) {
++        uint64_t missed = e->missed;
++        LeaveCriticalSection(&s->lock);
++        if (p->vbl_reported_active) {
++            MP_VERBOSE(ctx, "vsync-lock: feedback lost\n");
++            p->vbl_reported_active = false;
++        }
++        p->vbl_have_prev = false;
++        p->st_nofb++;
++        vbl_log_stats(ctx, arrive, missed);
++        return;
++    }
++
++    if (e->epoch != p->vbl_epoch) {
++        p->vbl_epoch = e->epoch;
++        p->vbl_have_prev = false;
++    }
++
++    // Same target selection as win_swap_buffers.
++    double period = e->period;
++    double since = (double)arrive - e->phase;
++    int64_t k = (int64_t)floor(since / period);
++    uint64_t cur = (uint64_t)((int64_t)e->seq + k);
++    double offset = since - (double)k * period;
++    uint64_t target = cur + 1;
++    if ((double)arrive >= e->last_wake && target <= e->seq)
++        target = e->seq + 1;
++    if (p->vbl_have_prev && target <= p->vbl_prev_target)
++        target = p->vbl_prev_target + 1;
++
++    double shown = e->phase + ((double)target - (double)e->seq) * period;
++    unsigned epoch = e->epoch;
++    uint64_t missed = e->missed;
++    LeaveCriticalSection(&s->lock);
++
++    int64_t skipped = p->vbl_have_prev ? (int64_t)(target - p->vbl_prev_target) - 1 : 0;
++    p->vbl_prev_target = target;
++    p->vbl_have_prev = true;
++
++    p->pend_valid = true;
++    p->pend_target = target;
++    p->pend_epoch = epoch;
++    p->pend_limit = arrive + (int64_t)((double)(target - cur) * period + 2 * period);
++
++    p->fb_valid = true;
++    p->fb_time = llrint(shown);
++    p->fb_period = llrint(period);
++    p->fb_skipped = skipped;
++
++    if (!p->vbl_reported_active) {
++        MP_VERBOSE(ctx, "vsync-lock: %s (pre-render pacing), host %.5f Hz\n",
++                   p->vbl_mode >= 5 ? "feedback active" : "pacing active (feedback not reported)",
++                   1e9 / period);
++        p->vbl_reported_active = true;
++    }
++
++    p->st_frames++;
++    if (skipped > 0) {
++        p->st_late++;
++        p->st_skipped += (uint64_t)skipped;
++    }
++    p->st_off_sum += offset;
++    p->st_off_max = MPMAX(p->st_off_max, offset);
++    p->st_period = period;
++    vbl_log_stats(ctx, arrive, missed);
++}
++
++static bool win_check_visible(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    struct vbl_shared *s = p->vbl;
++    if (!s || !p->pend_valid)
++        return true;
++    p->pend_valid = false;
++
++    // Wait until the previously presented image has been latched, so that
++    // this frame cannot replace it in the mailbox.
++    int64_t begin = mp_time_ns();
++    bool timed_out = false;
++    EnterCriticalSection(&s->lock);
++    struct vbl_est *e = &s->est;
++    while (e->seq < p->pend_target && e->epoch == p->pend_epoch &&
++           !InterlockedCompareExchange(&s->stop, 0, 0))
++    {
++        int64_t now = mp_time_ns();
++        if (now >= p->pend_limit) {
++            timed_out = true;
++            break;
++        }
++        DWORD ms = (DWORD)((p->pend_limit - now) / 1000000) + 1;
++        SleepConditionVariableCS(&s->cond, &s->lock, ms);
++    }
++    LeaveCriticalSection(&s->lock);
++
++    if (timed_out) {
++        p->st_timeouts++;
++        p->vbl_have_prev = false;
++    }
++    double wait = (double)(mp_time_ns() - begin);
++    p->st_wait_sum += wait;
++    p->st_wait_max = MPMAX(p->st_wait_max, wait);
++    return true;
++}
++
 +// MPV_VSYNC_LOCK selects how much of the lock is active, for isolating its
 +// effects inside one build:
 +//   0  off: no watcher thread, no pacing, no feedback (vo.c fallback path)
@@ -559,6 +708,9 @@ index 43bdcf2..d28fc1e 100644
 +//   2  watcher + pacing: swap_buffers waits for the vblank, but get_vsync
 +//      reports nothing (vo.c fallback path)
 +//   3  full (default): watcher + pacing + feedback
++//   4  watcher + pre-render pacing: the wait moves from the end of
++//      swap_buffers to the start of the next frame, no feedback
++//   5  watcher + pre-render pacing + feedback
 +static int vbl_get_mode(void)
 +{
 +    const char *env = getenv("MPV_VSYNC_LOCK");
@@ -566,7 +718,7 @@ index 43bdcf2..d28fc1e 100644
 +        return 3;
 +    char *end = NULL;
 +    long v = strtol(env, &end, 10);
-+    if (end == env || *end || v < 0 || v > 3)
++    if (end == env || *end || v < 0 || v > 5)
 +        return 3;
 +    return (int)v;
 +}
@@ -591,7 +743,7 @@ index 43bdcf2..d28fc1e 100644
      ra_vk_ctx_uninit(ctx);
      mpvk_uninit(&p->vk);
      vo_w32_uninit(ctx->vo);
-@@ -84,9 +602,20 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -84,9 +743,25 @@ static bool win_init(struct ra_ctx *ctx)
           .hwnd = vo_w32_hwnd(ctx->vo),
      };
  
@@ -599,7 +751,10 @@ index 43bdcf2..d28fc1e 100644
 +    p->vbl = p->vbl_mode >= 1 ? vbl_start(ctx, vo_w32_hwnd(ctx->vo)) : NULL;
 +    static const char *const vbl_mode_names[] = {
 +        "off", "watcher only", "watcher + pacing", "watcher + pacing + feedback",
++        "watcher + pre-render pacing", "watcher + pre-render pacing + feedback",
 +    };
++    bool vbl_pre = p->vbl_mode >= 4;
++    bool vbl_fb = p->vbl_mode == 3 || p->vbl_mode == 5;
 +    MP_INFO(ctx, "vsync-lock: MPV_VSYNC_LOCK=%d (%s)%s\n", p->vbl_mode,
 +            vbl_mode_names[p->vbl_mode],
 +            p->vbl_mode >= 1 && !p->vbl ? ", vblank API unavailable" : "");
@@ -607,8 +762,10 @@ index 43bdcf2..d28fc1e 100644
      struct ra_ctx_params params = {
          .color_depth = color_depth,
          .preferred_csp = preferred_csp,
-+        .swap_buffers = p->vbl && p->vbl_mode >= 2 ? win_swap_buffers : NULL,
-+        .get_vsync = p->vbl && p->vbl_mode >= 3 ? win_get_vsync : NULL,
++        .check_visible = p->vbl && vbl_pre ? win_check_visible : NULL,
++        .swap_buffers = !p->vbl || p->vbl_mode < 2 ? NULL
++                        : vbl_pre ? win_swap_buffers_pre : win_swap_buffers,
++        .get_vsync = p->vbl && vbl_fb ? win_get_vsync : NULL,
      };
  
      VkInstance inst = vk->vkinst->instance;
