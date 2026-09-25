@@ -225,22 +225,22 @@ jobs:
           echo "cache_suffix=$(date "+%Y-%m-%d")-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
-          # Pin toolchain sources to the 2026-06-18 build. The package source lock
-          # only covers packages/*.cmake; toolchain/ followed moving branches, and
+          # Pin toolchain sources to what the 2026-06-29 build (run 76544333057,
+          # "Packages Version") used. toolchain/ follows moving branches otherwise, and
           # windows-rs moved Windows.winmd on 2026-08-04 (404 in cppwinrt install).
           tc=mpv-winbuild-cmake/toolchain
-          sed -i 's|GIT_TAG release/22.x|GIT_TAG 1f5aee55a3fc26c87fc689011053d8069dd3d849|' $tc/llvm/llvm.cmake
-          grep -q 'GIT_TAG' $tc/mingw-w64.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/mingw-w64\/mingw-w64.git/a\    GIT_TAG 00349888007fef589c2604bf60d0ea14c0e2d606' $tc/mingw-w64.cmake
-          grep -q 'GIT_TAG' $tc/cppwinrt.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/microsoft\/cppwinrt.git/a\    GIT_TAG c4cf531f6a8ec29c0e7eb19ed817043405ba9fa7' $tc/cppwinrt.cmake
+          sed -i 's|GIT_TAG release/22.x|GIT_TAG ca7933e47d3a3451d81e72ac174dcb5aa28b59d1|' $tc/llvm/llvm.cmake
+          grep -q 'GIT_TAG' $tc/mingw-w64.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/mingw-w64\/mingw-w64.git/a\    GIT_TAG 31bd54ab7d5fe03c67ed2bb1a57e531b9c7f8cc4' $tc/mingw-w64.cmake
+          grep -q 'GIT_TAG' $tc/cppwinrt.cmake || sed -i '/GIT_REPOSITORY https:\/\/github.com\/microsoft\/cppwinrt.git/a\    GIT_TAG a31a05cedeee239995bbb09ea6867fbda9bb0fab' $tc/cppwinrt.cmake
           sed -i 's|windows-rs/raw/master/|windows-rs/raw/8c4ceb46142b2c30e13f5a8688f5efe4a22838a9/|' $tc/cppwinrt.cmake
           # A commit-pinned recipe must not keep GIT_REMOTE_NAME: cleanup() runs
           # reset_head.sh, which then does "git reset --hard @{u}" on a detached
           # HEAD and fails (exit 128, "HEAD does not point to a branch").
           # expat has no GIT_TAG, so the package source lock pins it the same way.
           sed -i '/^[[:space:]]*GIT_REMOTE_NAME origin[[:space:]]*$/d' $tc/llvm/llvm.cmake mpv-winbuild-cmake/packages/expat.cmake
-          if ! grep -q 'GIT_TAG 1f5aee55a3fc' $tc/llvm/llvm.cmake ||
-             ! grep -q 'GIT_TAG 00349888007f' $tc/mingw-w64.cmake ||
-             ! grep -q 'GIT_TAG c4cf531f6a8e' $tc/cppwinrt.cmake ||
+          if ! grep -q 'GIT_TAG ca7933e47d3a' $tc/llvm/llvm.cmake ||
+             ! grep -q 'GIT_TAG 31bd54ab7d5f' $tc/mingw-w64.cmake ||
+             ! grep -q 'GIT_TAG a31a05cedeee' $tc/cppwinrt.cmake ||
              ! grep -q 'windows-rs/raw/8c4ceb46142b' $tc/cppwinrt.cmake ||
              grep -q 'GIT_REMOTE_NAME' $tc/llvm/llvm.cmake mpv-winbuild-cmake/packages/expat.cmake; then
             echo "::error::toolchain pin failed"; exit 1
@@ -248,13 +248,13 @@ jobs:
           grep -n 'GIT_TAG\|GIT_REMOTE_NAME\|windows-rs' $tc/llvm/llvm.cmake $tc/mingw-w64.cmake $tc/cppwinrt.cmake mpv-winbuild-cmake/packages/expat.cmake
           # Vulkan-Loader and Vulkan-Headers follow main; the loader patch was
           # rebased for the June loader and conflicts with later ones. Pin the
-          # 2026-06-18 pair (both 1.4.354); drop GIT_REMOTE_NAME as above.
+          # pair the 2026-06-29 build used; drop GIT_REMOTE_NAME as above.
           pk=mpv-winbuild-cmake/packages
-          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG b52703d439c3077705db64e61c186545ddfdb2c7|' $pk/vulkan.cmake
-          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG 01393c3df0e5285b54ee6527466513f9e614be94|' $pk/vulkan-header.cmake
+          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG 0d210fdf88a81b0e833096079f73dda477da62f8|' $pk/vulkan.cmake
+          sed -i 's|^\([[:space:]]*\)GIT_TAG main[[:space:]]*$|\1GIT_TAG d2d8ded679e53c9f27c0c7a18750e661745886eb|' $pk/vulkan-header.cmake
           sed -i '/^[[:space:]]*GIT_REMOTE_NAME origin[[:space:]]*$/d' $pk/vulkan.cmake $pk/vulkan-header.cmake
-          if ! grep -q 'GIT_TAG b52703d439c3' $pk/vulkan.cmake ||
-             ! grep -q 'GIT_TAG 01393c3df0e5' $pk/vulkan-header.cmake ||
+          if ! grep -q 'GIT_TAG 0d210fdf88a8' $pk/vulkan.cmake ||
+             ! grep -q 'GIT_TAG d2d8ded679e5' $pk/vulkan-header.cmake ||
              grep -q 'GIT_REMOTE_NAME' $pk/vulkan.cmake $pk/vulkan-header.cmake; then
             echo "::error::vulkan pin failed"; exit 1
           fi
@@ -351,13 +351,13 @@ jobs:
           restore-keys: |
             source-${{ env.restore_suffix }}
       - name: Restore Toolchain Cache
-        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && env.toolchain_restore_key != '' }}
+        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && inputs.rebuild_llvm != true && env.toolchain_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
           key: ${{ env.toolchain_restore_key }}
       - name: Restore Build Cache
-        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && env.build_restore_key != '' }}
+        if: ${{ inputs.repro_618_deps != true && inputs.needclean != true && inputs.rebuild_llvm != true && env.build_restore_key != '' }}
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
@@ -597,7 +597,7 @@ jobs:
               try:
                   # Full commit history, filtered blobs. Needed for --before.
                   run(["git", "clone", "--bare", "--filter=blob:none", "--branch", branch, url, str(tmp / "repo.git")])
-                  sha = run(["git", "rev-list", "-n", "1", "--first-parent", f"--before={CUTOFF}", f"refs/heads/{branch}"], cwd=tmp / "repo.git").strip()
+                  sha = run(["git", "rev-list", "-n", "1", f"--before={CUTOFF}", f"refs/heads/{branch}"], cwd=tmp / "repo.git").strip()
                   if not sha:
                       raise SystemExit(f"no commit before {CUTOFF} for {url} {branch}")
                   cache[url] = sha
@@ -783,9 +783,9 @@ jobs:
           # to verified-good commits. Everything else stays at its cache value.
           declare -A PIN=(
             ["dav1d"]="14c73c7db38eebfd3202146b76a1ad4df90dd3a2"
-            ["aom"]="3f62de0eddedb9a246d32b150d6bc47baa790282"
-            ["ngtcp2"]="c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71"
-            ["nghttp3"]="056fbdf9102c4fbc40844dd1ae83d467af31dbeb"
+            ["aom"]="6d691cecc715c3b9985d22a72932b07d0d82a8c6"
+            ["ngtcp2"]="3a38b10c6de82bfa3a870d8eb438406f7994b247"
+            ["nghttp3"]="293e613c9cd6c9f8ab14c3657519259b5873dbff"
             ["uavs3d"]="0e20d2c291853f196c68922a264bcd8471d75b68"
           )
           for pkg in "${!PIN[@]}"; do
@@ -804,45 +804,100 @@ jobs:
             fi
           done
 
-          # === pin branch-tracking packages to their 2026-06-18 branch tip ===
-          # The source lock above only pins recipes without GIT_TAG; these follow a
-          # branch and would otherwise build whatever is at its tip today. Values are
-          # the first-parent branch tip at 2026-06-18T00:40Z (matches the June build
-          # where known: zlib 5d005c5, ngtcp2 c8cc2c1, nghttp3 056fbdf). libsixel is
-          # excluded from "ninja update", so its GIT_RESET never applies; pin it to
-          # that commit (its branch tip a0151d9 does not compile).
+          # === pin every package to the commit the 2026-06-29 build used ===
+          # Values: "Packages Version" of run 76544333057 (the build that produced
+          # mpv-x86_64-20260629-git-1b20837f35). Packages whose bundled patch was
+          # committed on top (fontconfig, luajit, spirv-cross, vulkan, libbs2b, mujs)
+          # are pinned to the base commit the patch was applied to. GIT_RESET
+          # packages (avisynth-headers, openssl, vapoursynth, xz) keep their reset
+          # commit, which matches that build; libsixel is outside "ninja update",
+          # so its GIT_RESET never applies and it is pinned here.
           python3 - <<'PY'
           from pathlib import Path
           import re, shutil, subprocess
-          TIP = {
-              "angle-headers": "1274adab943e1a13a251c67dd46bd971950c4d23",
-              "c-ares":        "c93e50f3ebc0373fe57677523ec960f6c1cb0e15",
-              "fast_float":    "34164f547b7df3f5d794ff67e9f885c36819ebfc",
-              "fontconfig":    "ee5ee31013d2474f23768219aa4740a288ba1305",
-              "glad":          "cef3f890c450a14701407c9fe50f5fd02f7440b7",
-              "glslang":       "79ccdf92ccc69c457e958ec72172c082f77b2d85",
-              "harfbuzz":      "ce1228bf5a337ebce438ab6658f13289688dd229",
-              "libjpeg":       "25b62127312b5df12a9d3ed4a000595d796bfb78",
-              "libmysofa":     "42f3ae68825a4eb2d5593a2308c3483ebbdd8bfe",
-              "libsdl2":       "3f1534af438c993244d5aaafafe76887374deb09",
-              "libvpx":        "572f663c893499db9e7f69bb2fec821eae6b1c40",
-              "libwebp":       "add5156cb23d8c2742ced4198be578b570f50c88",
-              "luajit":        "da6ed766c44cdc11a90915af02c88851739dcbc7",
-              "nghttp3":       "056fbdf9102c4fbc40844dd1ae83d467af31dbeb",
-              "ngtcp2":        "c8cc2c1365b6a1f1dcb35733a99b7d2fc3333a71",
-              "opus":          "3da9f7a6db1c05c3996cb363a9d1931a978bf1be",
-              "rubberband":    "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
-              "shaderc":       "0c40fcc31d5cf56fba33bff0b1d469c344139cd8",
-              "spirv-cross":   "146679ff8255a6068518685599d7fb8761d1b570",
-              "spirv-headers": "c63848ecf2200425511319fd8bf2c17b751e501e",
-              "spirv-tools":   "113784c9cf103b775fdadb1ef194f6b963e24a7e",
-              "subrandr":      "f1fee762b829c78d59b47f654d65d2ba6293eaa1",
-              "xxhash":        "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7",
-              "zlib":          "5d005c59dd782ac503a032aec2eba4c196dd1756",
-              "zstd":          "5233c58e6ca0b1c4c6b353ad79649191ed195bdc",
-              "libsixel":      "af12e5bc6f3f69ad83479da85ddb371420da9b17",
+          OLD = {
+              "amf-headers": "eadd00804d5f7e5cd8c85d540073198312870776",
+              "angle-headers": "98dab44d9cd2184bfd2b919a824efa4ceb067ace",
+              "aom": "6d691cecc715c3b9985d22a72932b07d0d82a8c6",
+              "brotli": "83fe766bc81f7911a78716b8d3b3d01367009995",
+              "bzip2": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
+              "c-ares": "c93e50f3ebc0373fe57677523ec960f6c1cb0e15",
+              "curl": "e1366945251ae3107194acb970ec4e40b1da5682",
+              "dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
+              "davs2": "f50435051b72c168c2b566c544e27fcff71ba61a",
+              "fast_float": "8ec5d236e2a9bc6b89a191212920c2237144f936",
+              "ffmpeg": "f760b2fb6",
+              "fontconfig": "f2c97a43cb35c7fffc47dae6f6e524322a88d964",
+              "freetype2": "25a08f24cfc0da879d1938352d026532f280b77e",
+              "fribidi": "069a7e3d31e6aa74f2068a8e0804106ce7906639",
+              "game-music-emu": "a5216b1dafe476b6de36a316a151c64df575197a",
+              "glad": "e3c14f906127dea49ead20ff4d5878294d08b7ab",
+              "glslang": "ce138e2c2d6992b31ff4cd2e955904637785a881",
+              "graphengine": "7bb77a5c062c610e7f44df6a59155cc3ab3e452a",
+              "harfbuzz": "afe68c5c1c3b1d2379acac66d751633a23937638",
+              "highway": "eb3479ebfceac4e2986dce3f902baa086904c4f9",
+              "lame": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
+              "lcms2": "76ffc49448b8bd6aa6a36c1f5869ab318831abb9",
+              "libarchive": "22d16a04e4f4c6a537a143c31930fc4e943a2028",
+              "libaribcaption": "f9d8c50fe5e51c98d101f69d74591295cb568036",
+              "libass": "35ba2ca",
+              "libbluray": "8b4fb6e2562bb86601ea5a2c4140af6d8f3f1cf4",
+              "libbs2b": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
+              "libdvdcss": "2682a4a7ed782e700a5b920f6f85c4f9736921c3",
+              "libdvdnav": "cf112772bf626f76a913efca5b883a381e4c123a",
+              "libdvdread": "6acfc10af09b780b8357c880f89a788d246e520b",
+              "libjpeg": "01d607bd618334ccb5bfdd7e1891dda11d58036c",
+              "libjxl": "33b7a9f6b3471d3182c64ab3f8aff8124e9a8605",
+              "libmodplug": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
+              "libmysofa": "3b7427c295d063724601f175ca05f81e29e3cc1a",
+              "libplacebo": "3be579e",
+              "libpng": "dd5d363ae1fc7778f2734bf51b10d3fe65028671",
+              "libpsl": "1780afdefdc27881891bbb56add83688a60653d1",
+              "libsamplerate": "2ccde9568cca73c7b32c97fefca2e418c16ae5e3",
+              "libsdl2": "b8b3f5ef2001cbe7c11f62d41a9bf47d4a2d8b07",
+              "libsixel": "af12e5bc6f3f69ad83479da85ddb371420da9b17",
+              "libsoxr": "945b592b70470e29f917f4de89b4281fbbd540c0",
+              "libsrt": "c39196c9a568ae4e3289dd65cf54ba4154deb4a1",
+              "libssh": "e224b86b2f0160b0590d1c6afef77230b812867b",
+              "libudfread": "139a2194525f2745b98a98e4d8fa627d07440176",
+              "libunibreak": "3ce4bfa3129ff3738046a44a6db533d2ce25af2b",
+              "libva": "ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c",
+              "libvpl": "d77f9195cf495b937631607333288fd917ae8939",
+              "libvpx": "06f21a12ea691de6686ba50bf870ff9875a64e25",
+              "libwebp": "3757b8afeb54e305eaef18502812a9a88b7ed662",
+              "libxml2": "13a3df99ffe2521a903f270abb33aa7092b34147",
+              "libzimg": "b3647572a01927e2aa8d0b7aaa917207c9c1ae5d",
+              "libzvbi": "41477c97c8edf7a01f1594b2a95b94f0117eed21",
+              "luajit": "b411bec3ce550ef9968fc83bca094455cf812c1f",
+              "mpv-packaging": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+              "mujs": "e892c9fdbbddba94e52f656ccb378ed4885e30cc",
+              "nghttp2": "65871b62828404ed8045f8e5d6c1dafc6b6f6e6a",
+              "nghttp3": "293e613c9cd6c9f8ab14c3657519259b5873dbff",
+              "ngtcp2": "3a38b10c6de82bfa3a870d8eb438406f7994b247",
+              "nvcodec-headers": "1b5a81ada8874efb2af0534ffe74049c557e212d",
+              "ogg": "06a5e0262cdc28aa4ae6797627a783b5010440f0",
+              "openal-soft": "dc98bfbe6064d851e32428db83b06732a448810b",
+              "opus": "3da9f7a6db1c05c3996cb363a9d1931a978bf1be",
+              "rubberband": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+              "shaderc": "0c40fcc31d5cf56fba33bff0b1d469c344139cd8",
+              "speex": "05895229896dc942d453446eba6f9f5ddcf95422",
+              "spirv-cross": "146679ff8255a6068518685599d7fb8761d1b570",
+              "spirv-headers": "daa093dd29aab8cbb6562b808370562f56e399fb",
+              "spirv-tools": "f25a3b067eed21f6ce43186942eec3c407cade02",
+              "subrandr": "7539b47b2bd855c8f686dbd54a92bf8a8027b369",
+              "svtav1": "7b41a3fc9a0652d2583a71a65ecac2950aafd1da",
+              "uavs3d": "0e20d2c291853f196c68922a264bcd8471d75b68",
+              "uchardet": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
+              "vorbis": "e3c9861ff096d52378e131ff8c334552e09cdffa",
+              "vulkan": "0d210fdf88a81b0e833096079f73dda477da62f8",
+              "vulkan-header": "d2d8ded679e53c9f27c0c7a18750e661745886eb",
+              "x264": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+              "x265": "9ca51acb177efa44892683a23b980ee71f47100c",
+              "xxhash": "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7",
+              "zlib": "f4b08115a14ca65b33286c7c0524ad2a3bf74881",
+              "zstd": "5233c58e6ca0b1c4c6b353ad79649191ed195bdc",
           }
-          for pkg, sha in TIP.items():
+          for pkg, sha in OLD.items():
               p = Path(f"packages/{pkg}.cmake")
               t = p.read_text()
               tags = re.findall(r"^[ \t]*GIT_TAG[ \t]", t, re.M)
@@ -864,11 +919,11 @@ jobs:
               if (src / ".git").exists():
                   head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
                                         capture_output=True, text=True).stdout.strip()
-                  if head != sha:
-                      print(f"TIP-RECLONE {pkg}: {head[:10]} -> {sha[:10]}")
+                  if not head.startswith(sha):
+                      print(f"OLD-RECLONE {pkg}: {head[:10]} -> {sha[:10]}")
                       shutil.rmtree(src, ignore_errors=True)
                       shutil.rmtree(f"build64/packages/{pkg}-prefix", ignore_errors=True)
-              print(f"TIP {pkg} -> {sha}")
+              print(f"OLD {pkg} -> {sha}")
           PY
 
           # build.sh reuses install_rustup as-is when it exists (cache restore);
