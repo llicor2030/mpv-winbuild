@@ -271,6 +271,126 @@ jobs:
           grep -n -o -- '--default-toolchain [^ ]*' $tc/rustup.cmake
 
 
+      - name: Write 2026-06-29 package pins
+        # Kept out of the Build step: a run: block that contains expressions is
+        # limited to 21000 characters as a whole.
+        shell: bash
+        run: |
+          cat > old_pins.py <<'PY'
+          from pathlib import Path
+          import re, shutil, subprocess
+          OLD = {
+              "amf-headers": "eadd00804d5f7e5cd8c85d540073198312870776",
+              "angle-headers": "98dab44d9cd2184bfd2b919a824efa4ceb067ace",
+              "aom": "6d691cecc715c3b9985d22a72932b07d0d82a8c6",
+              "brotli": "83fe766bc81f7911a78716b8d3b3d01367009995",
+              "bzip2": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
+              "c-ares": "c93e50f3ebc0373fe57677523ec960f6c1cb0e15",
+              "curl": "e1366945251ae3107194acb970ec4e40b1da5682",
+              "dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
+              "davs2": "f50435051b72c168c2b566c544e27fcff71ba61a",
+              "fast_float": "8ec5d236e2a9bc6b89a191212920c2237144f936",
+              "ffmpeg": "f760b2fb6",
+              "fontconfig": "f2c97a43cb35c7fffc47dae6f6e524322a88d964",
+              "freetype2": "25a08f24cfc0da879d1938352d026532f280b77e",
+              "fribidi": "069a7e3d31e6aa74f2068a8e0804106ce7906639",
+              "game-music-emu": "a5216b1dafe476b6de36a316a151c64df575197a",
+              "glad": "e3c14f906127dea49ead20ff4d5878294d08b7ab",
+              "glslang": "ce138e2c2d6992b31ff4cd2e955904637785a881",
+              "graphengine": "7bb77a5c062c610e7f44df6a59155cc3ab3e452a",
+              "harfbuzz": "afe68c5c1c3b1d2379acac66d751633a23937638",
+              "highway": "eb3479ebfceac4e2986dce3f902baa086904c4f9",
+              "lame": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
+              "lcms2": "76ffc49448b8bd6aa6a36c1f5869ab318831abb9",
+              "libarchive": "22d16a04e4f4c6a537a143c31930fc4e943a2028",
+              "libaribcaption": "f9d8c50fe5e51c98d101f69d74591295cb568036",
+              "libass": "35ba2ca",
+              "libbluray": "8b4fb6e2562bb86601ea5a2c4140af6d8f3f1cf4",
+              "libbs2b": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
+              "libdvdcss": "2682a4a7ed782e700a5b920f6f85c4f9736921c3",
+              "libdvdnav": "cf112772bf626f76a913efca5b883a381e4c123a",
+              "libdvdread": "6acfc10af09b780b8357c880f89a788d246e520b",
+              "libjpeg": "01d607bd618334ccb5bfdd7e1891dda11d58036c",
+              "libjxl": "33b7a9f6b3471d3182c64ab3f8aff8124e9a8605",
+              "libmodplug": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
+              "libmysofa": "3b7427c295d063724601f175ca05f81e29e3cc1a",
+              "libplacebo": "3be579e",
+              "libpng": "dd5d363ae1fc7778f2734bf51b10d3fe65028671",
+              "libpsl": "1780afdefdc27881891bbb56add83688a60653d1",
+              "libsamplerate": "2ccde9568cca73c7b32c97fefca2e418c16ae5e3",
+              "libsdl2": "b8b3f5ef2001cbe7c11f62d41a9bf47d4a2d8b07",
+              "libsixel": "af12e5bc6f3f69ad83479da85ddb371420da9b17",
+              "libsoxr": "945b592b70470e29f917f4de89b4281fbbd540c0",
+              "libsrt": "c39196c9a568ae4e3289dd65cf54ba4154deb4a1",
+              "libssh": "e224b86b2f0160b0590d1c6afef77230b812867b",
+              "libudfread": "139a2194525f2745b98a98e4d8fa627d07440176",
+              "libunibreak": "3ce4bfa3129ff3738046a44a6db533d2ce25af2b",
+              "libva": "ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c",
+              "libvpl": "d77f9195cf495b937631607333288fd917ae8939",
+              "libvpx": "06f21a12ea691de6686ba50bf870ff9875a64e25",
+              "libwebp": "3757b8afeb54e305eaef18502812a9a88b7ed662",
+              "libxml2": "13a3df99ffe2521a903f270abb33aa7092b34147",
+              "libzimg": "b3647572a01927e2aa8d0b7aaa917207c9c1ae5d",
+              "libzvbi": "41477c97c8edf7a01f1594b2a95b94f0117eed21",
+              "luajit": "b411bec3ce550ef9968fc83bca094455cf812c1f",
+              "mpv-packaging": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+              "mujs": "e892c9fdbbddba94e52f656ccb378ed4885e30cc",
+              "nghttp2": "65871b62828404ed8045f8e5d6c1dafc6b6f6e6a",
+              "nghttp3": "293e613c9cd6c9f8ab14c3657519259b5873dbff",
+              "ngtcp2": "3a38b10c6de82bfa3a870d8eb438406f7994b247",
+              "nvcodec-headers": "1b5a81ada8874efb2af0534ffe74049c557e212d",
+              "ogg": "06a5e0262cdc28aa4ae6797627a783b5010440f0",
+              "openal-soft": "dc98bfbe6064d851e32428db83b06732a448810b",
+              "opus": "3da9f7a6db1c05c3996cb363a9d1931a978bf1be",
+              "rubberband": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+              "shaderc": "0c40fcc31d5cf56fba33bff0b1d469c344139cd8",
+              "speex": "05895229896dc942d453446eba6f9f5ddcf95422",
+              "spirv-cross": "146679ff8255a6068518685599d7fb8761d1b570",
+              "spirv-headers": "daa093dd29aab8cbb6562b808370562f56e399fb",
+              "spirv-tools": "f25a3b067eed21f6ce43186942eec3c407cade02",
+              "subrandr": "7539b47b2bd855c8f686dbd54a92bf8a8027b369",
+              "svtav1": "7b41a3fc9a0652d2583a71a65ecac2950aafd1da",
+              "uavs3d": "0e20d2c291853f196c68922a264bcd8471d75b68",
+              "uchardet": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
+              "vorbis": "e3c9861ff096d52378e131ff8c334552e09cdffa",
+              "vulkan": "0d210fdf88a81b0e833096079f73dda477da62f8",
+              "vulkan-header": "d2d8ded679e53c9f27c0c7a18750e661745886eb",
+              "x264": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+              "x265": "9ca51acb177efa44892683a23b980ee71f47100c",
+              "xxhash": "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7",
+              "zlib": "f4b08115a14ca65b33286c7c0524ad2a3bf74881",
+              "zstd": "5233c58e6ca0b1c4c6b353ad79649191ed195bdc",
+          }
+          for pkg, sha in OLD.items():
+              p = Path(f"packages/{pkg}.cmake")
+              t = p.read_text()
+              tags = re.findall(r"^[ \t]*GIT_TAG[ \t]", t, re.M)
+              if len(tags) == 1:
+                  t = re.sub(r"^([ \t]*)GIT_TAG[ \t]+\S+[ \t]*$", rf"\g<1>GIT_TAG {sha}", t, flags=re.M)
+              elif not tags:
+                  t = re.sub(r"^([ \t]*)(GIT_REPOSITORY[ \t]+\S+)[ \t]*$", rf"\g<1>\g<2>\n\g<1>GIT_TAG {sha}", t, count=1, flags=re.M)
+              else:
+                  raise SystemExit(f"{p}: {len(tags)} GIT_TAG lines")
+              # commit-pinned + GIT_REMOTE_NAME makes cleanup() run "git reset --hard @{u}"
+              # on a detached HEAD (exit 128)
+              t = re.sub(r"^[ \t]*GIT_REMOTE_NAME[ \t]+origin[ \t]*\n", "", t, flags=re.M)
+              p.write_text(t)
+              if not re.search(rf"^[ \t]*GIT_TAG {sha}[ \t]*$", t, re.M) or "GIT_REMOTE_NAME" in t:
+                  raise SystemExit(f"{p}: pin not applied")
+              # a cache-restored source is not re-cloned by ExternalProject: drop it if
+              # it is not at the pinned commit
+              src = Path(f"src_packages/{pkg}")
+              if (src / ".git").exists():
+                  head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True).stdout.strip()
+                  if not head.startswith(sha):
+                      print(f"OLD-RECLONE {pkg}: {head[:10]} -> {sha[:10]}")
+                      shutil.rmtree(src, ignore_errors=True)
+                      shutil.rmtree(f"build64/packages/{pkg}-prefix", ignore_errors=True)
+              print(f"OLD {pkg} -> {sha}")
+          PY
+          python3 -c "import ast,sys; ast.parse(open('old_pins.py').read())"
+          grep -c '^    "' old_pins.py
       - name: Lookup Toolchain Cache
         id: lookup_toolchain
         uses: actions/cache/restore@v5.0.5
@@ -812,119 +932,7 @@ jobs:
           # packages (avisynth-headers, openssl, vapoursynth, xz) keep their reset
           # commit, which matches that build; libsixel is outside "ninja update",
           # so its GIT_RESET never applies and it is pinned here.
-          python3 - <<'PY'
-          from pathlib import Path
-          import re, shutil, subprocess
-          OLD = {
-              "amf-headers": "eadd00804d5f7e5cd8c85d540073198312870776",
-              "angle-headers": "98dab44d9cd2184bfd2b919a824efa4ceb067ace",
-              "aom": "6d691cecc715c3b9985d22a72932b07d0d82a8c6",
-              "brotli": "83fe766bc81f7911a78716b8d3b3d01367009995",
-              "bzip2": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
-              "c-ares": "c93e50f3ebc0373fe57677523ec960f6c1cb0e15",
-              "curl": "e1366945251ae3107194acb970ec4e40b1da5682",
-              "dav1d": "14c73c7db38eebfd3202146b76a1ad4df90dd3a2",
-              "davs2": "f50435051b72c168c2b566c544e27fcff71ba61a",
-              "fast_float": "8ec5d236e2a9bc6b89a191212920c2237144f936",
-              "ffmpeg": "f760b2fb6",
-              "fontconfig": "f2c97a43cb35c7fffc47dae6f6e524322a88d964",
-              "freetype2": "25a08f24cfc0da879d1938352d026532f280b77e",
-              "fribidi": "069a7e3d31e6aa74f2068a8e0804106ce7906639",
-              "game-music-emu": "a5216b1dafe476b6de36a316a151c64df575197a",
-              "glad": "e3c14f906127dea49ead20ff4d5878294d08b7ab",
-              "glslang": "ce138e2c2d6992b31ff4cd2e955904637785a881",
-              "graphengine": "7bb77a5c062c610e7f44df6a59155cc3ab3e452a",
-              "harfbuzz": "afe68c5c1c3b1d2379acac66d751633a23937638",
-              "highway": "eb3479ebfceac4e2986dce3f902baa086904c4f9",
-              "lame": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
-              "lcms2": "76ffc49448b8bd6aa6a36c1f5869ab318831abb9",
-              "libarchive": "22d16a04e4f4c6a537a143c31930fc4e943a2028",
-              "libaribcaption": "f9d8c50fe5e51c98d101f69d74591295cb568036",
-              "libass": "35ba2ca",
-              "libbluray": "8b4fb6e2562bb86601ea5a2c4140af6d8f3f1cf4",
-              "libbs2b": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
-              "libdvdcss": "2682a4a7ed782e700a5b920f6f85c4f9736921c3",
-              "libdvdnav": "cf112772bf626f76a913efca5b883a381e4c123a",
-              "libdvdread": "6acfc10af09b780b8357c880f89a788d246e520b",
-              "libjpeg": "01d607bd618334ccb5bfdd7e1891dda11d58036c",
-              "libjxl": "33b7a9f6b3471d3182c64ab3f8aff8124e9a8605",
-              "libmodplug": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
-              "libmysofa": "3b7427c295d063724601f175ca05f81e29e3cc1a",
-              "libplacebo": "3be579e",
-              "libpng": "dd5d363ae1fc7778f2734bf51b10d3fe65028671",
-              "libpsl": "1780afdefdc27881891bbb56add83688a60653d1",
-              "libsamplerate": "2ccde9568cca73c7b32c97fefca2e418c16ae5e3",
-              "libsdl2": "b8b3f5ef2001cbe7c11f62d41a9bf47d4a2d8b07",
-              "libsixel": "af12e5bc6f3f69ad83479da85ddb371420da9b17",
-              "libsoxr": "945b592b70470e29f917f4de89b4281fbbd540c0",
-              "libsrt": "c39196c9a568ae4e3289dd65cf54ba4154deb4a1",
-              "libssh": "e224b86b2f0160b0590d1c6afef77230b812867b",
-              "libudfread": "139a2194525f2745b98a98e4d8fa627d07440176",
-              "libunibreak": "3ce4bfa3129ff3738046a44a6db533d2ce25af2b",
-              "libva": "ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c",
-              "libvpl": "d77f9195cf495b937631607333288fd917ae8939",
-              "libvpx": "06f21a12ea691de6686ba50bf870ff9875a64e25",
-              "libwebp": "3757b8afeb54e305eaef18502812a9a88b7ed662",
-              "libxml2": "13a3df99ffe2521a903f270abb33aa7092b34147",
-              "libzimg": "b3647572a01927e2aa8d0b7aaa917207c9c1ae5d",
-              "libzvbi": "41477c97c8edf7a01f1594b2a95b94f0117eed21",
-              "luajit": "b411bec3ce550ef9968fc83bca094455cf812c1f",
-              "mpv-packaging": "1c534ce8c21fab0be2a394ad73decc15e015693e",
-              "mujs": "e892c9fdbbddba94e52f656ccb378ed4885e30cc",
-              "nghttp2": "65871b62828404ed8045f8e5d6c1dafc6b6f6e6a",
-              "nghttp3": "293e613c9cd6c9f8ab14c3657519259b5873dbff",
-              "ngtcp2": "3a38b10c6de82bfa3a870d8eb438406f7994b247",
-              "nvcodec-headers": "1b5a81ada8874efb2af0534ffe74049c557e212d",
-              "ogg": "06a5e0262cdc28aa4ae6797627a783b5010440f0",
-              "openal-soft": "dc98bfbe6064d851e32428db83b06732a448810b",
-              "opus": "3da9f7a6db1c05c3996cb363a9d1931a978bf1be",
-              "rubberband": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
-              "shaderc": "0c40fcc31d5cf56fba33bff0b1d469c344139cd8",
-              "speex": "05895229896dc942d453446eba6f9f5ddcf95422",
-              "spirv-cross": "146679ff8255a6068518685599d7fb8761d1b570",
-              "spirv-headers": "daa093dd29aab8cbb6562b808370562f56e399fb",
-              "spirv-tools": "f25a3b067eed21f6ce43186942eec3c407cade02",
-              "subrandr": "7539b47b2bd855c8f686dbd54a92bf8a8027b369",
-              "svtav1": "7b41a3fc9a0652d2583a71a65ecac2950aafd1da",
-              "uavs3d": "0e20d2c291853f196c68922a264bcd8471d75b68",
-              "uchardet": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
-              "vorbis": "e3c9861ff096d52378e131ff8c334552e09cdffa",
-              "vulkan": "0d210fdf88a81b0e833096079f73dda477da62f8",
-              "vulkan-header": "d2d8ded679e53c9f27c0c7a18750e661745886eb",
-              "x264": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
-              "x265": "9ca51acb177efa44892683a23b980ee71f47100c",
-              "xxhash": "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7",
-              "zlib": "f4b08115a14ca65b33286c7c0524ad2a3bf74881",
-              "zstd": "5233c58e6ca0b1c4c6b353ad79649191ed195bdc",
-          }
-          for pkg, sha in OLD.items():
-              p = Path(f"packages/{pkg}.cmake")
-              t = p.read_text()
-              tags = re.findall(r"^[ \t]*GIT_TAG[ \t]", t, re.M)
-              if len(tags) == 1:
-                  t = re.sub(r"^([ \t]*)GIT_TAG[ \t]+\S+[ \t]*$", rf"\g<1>GIT_TAG {sha}", t, flags=re.M)
-              elif not tags:
-                  t = re.sub(r"^([ \t]*)(GIT_REPOSITORY[ \t]+\S+)[ \t]*$", rf"\g<1>\g<2>\n\g<1>GIT_TAG {sha}", t, count=1, flags=re.M)
-              else:
-                  raise SystemExit(f"{p}: {len(tags)} GIT_TAG lines")
-              # commit-pinned + GIT_REMOTE_NAME makes cleanup() run "git reset --hard @{u}"
-              # on a detached HEAD (exit 128)
-              t = re.sub(r"^[ \t]*GIT_REMOTE_NAME[ \t]+origin[ \t]*\n", "", t, flags=re.M)
-              p.write_text(t)
-              if not re.search(rf"^[ \t]*GIT_TAG {sha}[ \t]*$", t, re.M) or "GIT_REMOTE_NAME" in t:
-                  raise SystemExit(f"{p}: pin not applied")
-              # a cache-restored source is not re-cloned by ExternalProject: drop it if
-              # it is not at the pinned commit
-              src = Path(f"src_packages/{pkg}")
-              if (src / ".git").exists():
-                  head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
-                                        capture_output=True, text=True).stdout.strip()
-                  if not head.startswith(sha):
-                      print(f"OLD-RECLONE {pkg}: {head[:10]} -> {sha[:10]}")
-                      shutil.rmtree(src, ignore_errors=True)
-                      shutil.rmtree(f"build64/packages/{pkg}-prefix", ignore_errors=True)
-              print(f"OLD {pkg} -> {sha}")
-          PY
+          python3 ../old_pins.py
 
           # build.sh reuses install_rustup as-is when it exists (cache restore);
           # drop it unless it holds the pinned nightly.
