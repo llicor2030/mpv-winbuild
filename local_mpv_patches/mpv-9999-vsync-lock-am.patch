@@ -1,4 +1,4 @@
-From e674385f97d9ad565e2aedb4dfac559a2f181f06 Mon Sep 17 00:00:00 2001
+From b1d1b424f2243ae471b949187a0e8e4f363d9061 Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
 Date: Thu, 24 Sep 2026 06:23:30 +0000
 Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
@@ -110,13 +110,24 @@ frame's own GPU work had completed 35 ms before the vblank, and every block
 longer than the margin became a repeated and a dropped frame (98 per 27 min
 at 6 ms, 9 at 35 ms). 35 ms puts the present a few ms after the previous
 vblank, close to where an unpaced VO presents.
+
+Mode 8 also times the Vulkan calls inside the present: the device is created
+through a vkGetInstanceProcAddr wrapper (new optional mpvk_ctx.get_proc_addr)
+that hands libplacebo timed vkQueueSubmit, vkQueueSubmit2(KHR) and
+vkQueuePresentKHR; only calls from the VO thread between pre_present and
+post_present are counted. The timer sleep runs at THREAD_PRIORITY_HIGHEST
+(restored before the present call; the sleep uses no CPU), and a sleep that
+overshoots by more than 10 ms is logged with the wait result, the thread's
+CPU time during the sleep, the vblanks the watcher saw meanwhile and the
+time spent taking the estimate lock.
 ---
  video/out/gpu/context.h        |   13 +
  video/out/vo_gpu_next.c        |    4 +
- video/out/vulkan/context.c     |   39 +-
+ video/out/vulkan/common.h      |    3 +
+ video/out/vulkan/context.c     |   48 +-
  video/out/vulkan/context.h     |    4 +
- video/out/vulkan/context_win.c | 1212 ++++++++++++++++++++++++++++++++
- 5 files changed, 1271 insertions(+), 1 deletion(-)
+ video/out/vulkan/context_win.c | 1388 ++++++++++++++++++++++++++++++++
+ 6 files changed, 1458 insertions(+), 2 deletions(-)
 
 diff --git a/video/out/gpu/context.h b/video/out/gpu/context.h
 index 6c5d008..4f4b385 100644
@@ -166,8 +177,20 @@ index 308a9fb..22d9e8c 100644
          p->frame_pending = false;
      }
  
+diff --git a/video/out/vulkan/common.h b/video/out/vulkan/common.h
+index e75cb22..f704c57 100644
+--- a/video/out/vulkan/common.h
++++ b/video/out/vulkan/common.h
+@@ -36,4 +36,7 @@ struct mpvk_ctx {
+     pl_gpu gpu; // points to vulkan->gpu for convenience
+     pl_swapchain swapchain;
+     VkSurfaceKHR surface;
++    // Optional: used instead of vkinst->get_proc_addr when the device is
++    // created (lets a context wrap Vulkan entry points).
++    PFN_vkGetInstanceProcAddr get_proc_addr;
+ };
 diff --git a/video/out/vulkan/context.c b/video/out/vulkan/context.c
-index d062ea8..e247faa 100644
+index d062ea8..0ee2110 100644
 --- a/video/out/vulkan/context.c
 +++ b/video/out/vulkan/context.c
 @@ -31,6 +31,8 @@ struct vulkan_opts {
@@ -200,7 +223,23 @@ index d062ea8..e247faa 100644
      },
      .change_flags = UPDATE_VO,
  };
-@@ -487,6 +496,15 @@ char *ra_vk_ctx_get_device_name(struct ra_ctx *ctx)
+@@ -430,7 +439,14 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+     p->params = params;
+     p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
+ 
+-    vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, vk->surface,
++    pl_vk_inst vkinst = vk->vkinst;
++    struct pl_vk_inst_t vkinst_override;
++    if (vk->get_proc_addr) {
++        vkinst_override = *vk->vkinst;
++        vkinst_override.get_proc_addr = vk->get_proc_addr;
++        vkinst = &vkinst_override;
++    }
++    vk->vulkan = mppl_create_vulkan(p->opts, vkinst, vk->pllog, vk->surface,
+                                     ctx->opts.allow_sw);
+     if (!vk->vulkan)
+         goto error;
+@@ -487,6 +503,15 @@ char *ra_vk_ctx_get_device_name(struct ra_ctx *ctx)
      return device_name;
  }
  
@@ -216,7 +255,7 @@ index d062ea8..e247faa 100644
  static int color_depth(struct ra_swapchain *sw)
  {
      struct priv *p = sw->priv;
-@@ -522,10 +540,27 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
+@@ -522,10 +547,27 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
      return true;
  }
  
@@ -245,7 +284,7 @@ index d062ea8..e247faa 100644
  }
  
  static void swap_buffers(struct ra_swapchain *sw)
-@@ -589,6 +624,8 @@ static const struct ra_swapchain_fns vulkan_swapchain = {
+@@ -589,6 +631,8 @@ static const struct ra_swapchain_fns vulkan_swapchain = {
      .target_csp    = target_csp,
      .start_frame   = start_frame,
      .submit_frame  = submit_frame,
@@ -267,16 +306,17 @@ index c3013ed..8e4b4a8 100644
 +// context only; see context_win.c).
 +void ra_vk_ctx_get_vsync_lock(struct ra_ctx *ctx, int *mode, double *margin_ms);
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..5fdf6c2 100644
+index 43bdcf2..7cae007 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
-@@ -15,6 +15,13 @@
+@@ -15,6 +15,14 @@
   * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
   */
  
 +#include <math.h>
 +#include <stdint.h>
 +#include <stdlib.h>
++#include <string.h>
 +
 +#include <windows.h>
 +
@@ -284,7 +324,7 @@ index 43bdcf2..5fdf6c2 100644
  #include "video/out/gpu/context.h"
  #include "video/out/gpu/d3d11_helpers.h"
  #include "video/out/w32_common.h"
-@@ -26,15 +33,1178 @@
+@@ -26,15 +34,1348 @@
  EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
  
@@ -759,6 +799,104 @@ index 43bdcf2..5fdf6c2 100644
 +    vbl_unref(s);
 +}
 +
++// Timing of the Vulkan calls inside the present (mode 8). libplacebo loads
++// every entry point through the vkGetInstanceProcAddr it is given, so the
++// device is created with a wrapper that hands out timed versions of
++// vkQueueSubmit, vkQueueSubmit2(KHR) and vkQueuePresentKHR. Only calls made
++// by the VO thread between pre_present and post_present are counted; the
++// wrappers only forward otherwise.
++static PFN_vkGetInstanceProcAddr vbl_vk_real_gipa;
++static PFN_vkGetDeviceProcAddr vbl_vk_real_gdpa;
++static PFN_vkQueueSubmit vbl_vk_real_submit;
++static PFN_vkQueueSubmit2KHR vbl_vk_real_submit2;
++static PFN_vkQueueSubmit2KHR vbl_vk_real_submit2khr;
++static PFN_vkQueuePresentKHR vbl_vk_real_present;
++static volatile DWORD vbl_vk_thread;    // VO thread while timing, else 0
++static double vbl_vk_submit_ns, vbl_vk_present_ns;
++
++static bool vbl_vk_timed(void)
++{
++    DWORD t = vbl_vk_thread;
++    return t && t == GetCurrentThreadId();
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL vbl_vk_submit(VkQueue q, uint32_t n,
++                                                   const VkSubmitInfo *info, VkFence f)
++{
++    if (!vbl_vk_timed())
++        return vbl_vk_real_submit(q, n, info, f);
++    int64_t t0 = mp_time_ns();
++    VkResult r = vbl_vk_real_submit(q, n, info, f);
++    vbl_vk_submit_ns += (double)(mp_time_ns() - t0);
++    return r;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL vbl_vk_submit2(VkQueue q, uint32_t n,
++                                                    const VkSubmitInfo2 *info, VkFence f)
++{
++    if (!vbl_vk_timed())
++        return vbl_vk_real_submit2(q, n, info, f);
++    int64_t t0 = mp_time_ns();
++    VkResult r = vbl_vk_real_submit2(q, n, info, f);
++    vbl_vk_submit_ns += (double)(mp_time_ns() - t0);
++    return r;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL vbl_vk_submit2khr(VkQueue q, uint32_t n,
++                                                       const VkSubmitInfo2 *info, VkFence f)
++{
++    if (!vbl_vk_timed())
++        return vbl_vk_real_submit2khr(q, n, info, f);
++    int64_t t0 = mp_time_ns();
++    VkResult r = vbl_vk_real_submit2khr(q, n, info, f);
++    vbl_vk_submit_ns += (double)(mp_time_ns() - t0);
++    return r;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL vbl_vk_present(VkQueue q, const VkPresentInfoKHR *info)
++{
++    if (!vbl_vk_timed())
++        return vbl_vk_real_present(q, info);
++    int64_t t0 = mp_time_ns();
++    VkResult r = vbl_vk_real_present(q, info);
++    vbl_vk_present_ns += (double)(mp_time_ns() - t0);
++    return r;
++}
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vbl_vk_gdpa(VkDevice dev, const char *name)
++{
++    PFN_vkVoidFunction f = vbl_vk_real_gdpa(dev, name);
++    if (!f || !name)
++        return f;
++    if (!strcmp(name, "vkQueueSubmit")) {
++        vbl_vk_real_submit = (PFN_vkQueueSubmit)f;
++        return (PFN_vkVoidFunction)vbl_vk_submit;
++    }
++    if (!strcmp(name, "vkQueueSubmit2")) {
++        vbl_vk_real_submit2 = (PFN_vkQueueSubmit2KHR)f;
++        return (PFN_vkVoidFunction)vbl_vk_submit2;
++    }
++    if (!strcmp(name, "vkQueueSubmit2KHR")) {
++        vbl_vk_real_submit2khr = (PFN_vkQueueSubmit2KHR)f;
++        return (PFN_vkVoidFunction)vbl_vk_submit2khr;
++    }
++    if (!strcmp(name, "vkQueuePresentKHR")) {
++        vbl_vk_real_present = (PFN_vkQueuePresentKHR)f;
++        return (PFN_vkVoidFunction)vbl_vk_present;
++    }
++    return f;
++}
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vbl_vk_gipa(VkInstance inst, const char *name)
++{
++    PFN_vkVoidFunction f = vbl_vk_real_gipa(inst, name);
++    if (f && name && !strcmp(name, "vkGetDeviceProcAddr")) {
++        vbl_vk_real_gdpa = (PFN_vkGetDeviceProcAddr)f;
++        return (PFN_vkVoidFunction)vbl_vk_gdpa;
++    }
++    return f;
++}
++
  struct priv {
      struct mpvk_ctx vk;
      struct mp_dxgi_factory_ctx dxgi_ctx;
@@ -791,6 +929,8 @@ index 43bdcf2..5fdf6c2 100644
 +    int64_t pll_swap_prev;      // previous swap_buffers returned
 +    double pll_plan;            // sleep the timer asked for (ns)
 +    double pll_wake_err;        // phase error at pll_wake (ns), > 0: late
++    double pll_vk_submit;       // time in vkQueueSubmit* during the present (ns)
++    double pll_vk_present;      // time in vkQueuePresentKHR (ns)
 +
 +    // Feedback for the swap that just finished.
 +    bool fb_valid;
@@ -813,6 +953,9 @@ index 43bdcf2..5fdf6c2 100644
 +    // often it completed after the planned present / after the vblank.
 +    double st_gpu_sum, st_gpu_max;
 +    unsigned st_gpu_after_target, st_gpu_after_vblank;
++    // Mode 8: Vulkan calls inside the present, and timer overshoot.
++    double st_vks_sum, st_vks_max, st_vkp_sum, st_vkp_max, st_over_max;
++    unsigned st_over;
  };
  
 +static void vbl_log_stats(struct ra_ctx *ctx, int64_t now, uint64_t missed)
@@ -862,6 +1005,15 @@ index 43bdcf2..5fdf6c2 100644
 +                   p->st_gpu_after_target, p->st_gpu_after_vblank);
 +        p->st_gpu_sum = p->st_gpu_max = 0;
 +        p->st_gpu_after_target = p->st_gpu_after_vblank = 0;
++        MP_VERBOSE(ctx, "vsync-lock: vk submit mean %.2f ms max %.2f ms, "
++                   "vk present mean %.2f ms max %.2f ms, "
++                   "timer overshoot >2 ms %u, max %.2f ms\n",
++                   p->st_vks_sum / m / VBL_NS_PER_MS, p->st_vks_max / VBL_NS_PER_MS,
++                   p->st_vkp_sum / m / VBL_NS_PER_MS, p->st_vkp_max / VBL_NS_PER_MS,
++                   p->st_over, p->st_over_max / VBL_NS_PER_MS);
++        p->st_vks_sum = p->st_vks_max = p->st_vkp_sum = p->st_vkp_max = 0;
++        p->st_over = 0;
++        p->st_over_max = 0;
 +        p->st_pp_n = p->st_late_lines = p->st_late_hidden = 0;
 +        p->st_call_sum = p->st_call_max = p->st_swapw_sum = p->st_swapw_max = 0;
 +        p->st_vo_sum = p->st_vo_max = 0;
@@ -1124,18 +1276,29 @@ index 43bdcf2..5fdf6c2 100644
 +
 +// AccurateSleep() with shadPS4's high-resolution waitable timer (Windows 10
 +// 1803+), falling back to a plain waitable timer.
-+static void vbl_pll_sleep(struct priv *p, double ns)
++// Returns the WaitForSingleObject result, or -1 when Sleep() was used.
++static long vbl_pll_sleep(struct priv *p, double ns)
 +{
 +    if (ns <= 0)
-+        return;
++        return 0;
 +    LARGE_INTEGER due = { .QuadPart = -(LONGLONG)(ns / 100.0) };
 +    if (p->pll_timer && due.QuadPart < 0 &&
 +        SetWaitableTimer(p->pll_timer, &due, 0, NULL, NULL, FALSE))
 +    {
-+        WaitForSingleObject(p->pll_timer, INFINITE);
-+        return;
++        return (long)WaitForSingleObject(p->pll_timer, INFINITE);
 +    }
 +    Sleep((DWORD)(ns / VBL_NS_PER_MS));
++    return -1;
++}
++
++static double vbl_thread_cpu_ns(void)
++{
++    FILETIME c, e, k, u;
++    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
++        return 0;
++    ULARGE_INTEGER kk = { .LowPart = k.dwLowDateTime, .HighPart = k.dwHighDateTime };
++    ULARGE_INTEGER uu = { .LowPart = u.dwLowDateTime, .HighPart = u.dwHighDateTime };
++    return (double)(kk.QuadPart + uu.QuadPart) * 100.0;
 +}
 +
 +// Feed one phase error into VsyncLock's lock state and the statistics.
@@ -1177,9 +1340,11 @@ index 43bdcf2..5fdf6c2 100644
 +
 +    double now = (double)mp_time_ns();
 +    EnterCriticalSection(&s->lock);
++    double locked_at = (double)mp_time_ns();
 +    // shadPS4 wants 60 accepted vblanks before it uses the estimate.
 +    bool valid = vbl_est_valid(&s->est, now) && s->est.samples >= 60;
 +    double host = s->est.period;
++    uint64_t seq0 = s->est.seq;
 +    LeaveCriticalSection(&s->lock);
 +
 +    if (!valid) {
@@ -1193,12 +1358,47 @@ index 43bdcf2..5fdf6c2 100644
 +    vbl_pll_timer_end(pl, now);
 +    double begin = now;
 +    double plan = 0;
++    long wres = 0;
++    double cpu0 = 0, slept_from = 0;
 +    if (pl->start > 0 && pl->total_wait > 0) {
 +        plan = fmin(pl->total_wait, 2 * host);
-+        vbl_pll_sleep(p, plan);
++        // Mode 8: sleep at raised priority, so that the wake-up is not held
++        // up behind the CPU work of the other threads (decoder, CPU filters).
++        // Restored before the present call. The sleep itself uses no CPU.
++        int prio = THREAD_PRIORITY_ERROR_RETURN;
++        if (err_at_wake) {
++            prio = GetThreadPriority(GetCurrentThread());
++            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++            cpu0 = vbl_thread_cpu_ns();
++        }
++        slept_from = (double)mp_time_ns();
++        wres = vbl_pll_sleep(p, plan);
++        if (prio != THREAD_PRIORITY_ERROR_RETURN)
++            SetThreadPriority(GetCurrentThread(), prio);
 +    }
 +    pl->start = (double)mp_time_ns();
 +    pl->total_wait -= pl->start - begin;
++
++    // Mode 8: how late the timer woke the VO, and what else happened meanwhile.
++    if (err_at_wake && plan > 0) {
++        double over = (pl->start - slept_from) - plan;
++        if (over > 2 * VBL_NS_PER_MS)
++            p->st_over++;
++        p->st_over_max = fmax(p->st_over_max, over);
++        if (over > 10 * VBL_NS_PER_MS) {
++            EnterCriticalSection(&s->lock);
++            uint64_t seq1 = s->est.seq;
++            LeaveCriticalSection(&s->lock);
++            MP_VERBOSE(ctx, "vsync-lock: timer overslept: planned %.2f ms, slept %.2f ms "
++                       "(+%.2f), wait result %ld, thread cpu %.2f ms, vblanks seen %llu, "
++                       "lock wait %.2f ms\n",
++                       plan / VBL_NS_PER_MS, (pl->start - slept_from) / VBL_NS_PER_MS,
++                       over / VBL_NS_PER_MS, wres,
++                       (vbl_thread_cpu_ns() - cpu0) / VBL_NS_PER_MS,
++                       (unsigned long long)(seq1 - seq0),
++                       (locked_at - now) / VBL_NS_PER_MS);
++        }
++    }
 +
 +    if (err_at_wake) {
 +        EnterCriticalSection(&s->lock);
@@ -1245,6 +1445,8 @@ index 43bdcf2..5fdf6c2 100644
 +        pl_gpu_finish(p->vk.gpu);
 +    p->pll_done = mp_time_ns();
 +    vbl_pll_tick(ctx, true);
++    vbl_vk_submit_ns = vbl_vk_present_ns = 0;
++    vbl_vk_thread = GetCurrentThreadId();
 +}
 +
 +// Mode 8: the present has been queued. This, not the return of swap_buffers
@@ -1254,6 +1456,9 @@ index 43bdcf2..5fdf6c2 100644
 +{
 +    struct priv *p = ctx->priv;
 +    p->pll_sub = mp_time_ns();
++    vbl_vk_thread = 0;
++    p->pll_vk_submit = vbl_vk_submit_ns;
++    p->pll_vk_present = vbl_vk_present_ns;
 +}
 +
 +// Modes 7 and 8, after the present: report the vblank to vo.c (see
@@ -1367,6 +1572,10 @@ index 43bdcf2..5fdf6c2 100644
 +        }
 +        double call = (double)(sub_t - wake_t);
 +        double swapw = (double)(done - sub_t);
++        p->st_vks_sum += p->pll_vk_submit;
++        p->st_vks_max = fmax(p->st_vks_max, p->pll_vk_submit);
++        p->st_vkp_sum += p->pll_vk_present;
++        p->st_vkp_max = fmax(p->st_vkp_max, p->pll_vk_present);
 +        double vo_t = swap_prev > 0 ? (double)(pre_t - swap_prev) : 0;
 +        p->st_pp_n++;
 +        p->st_call_sum += call;
@@ -1379,14 +1588,15 @@ index 43bdcf2..5fdf6c2 100644
 +            if (p->st_late_lines < 30) {
 +                MP_VERBOSE(ctx, "vsync-lock: late present: +%lld vblank, "
 +                           "pre_present %+.2f ms, gpu done %+.2f ms, wake %+.2f ms, queued %+.2f ms "
-+                           "(present call %.2f ms), swap wait %.2f ms, "
++                           "(present call %.2f ms, vk submit %.2f, vk present %.2f), swap wait %.2f ms, "
 +                           "sleep %.2f ms (planned %.2f), vo %.2f ms, wake err %+.2f ms\n",
 +                           (long long)(shown_at - expected),
 +                           ((double)pre_t - vbl) / VBL_NS_PER_MS,
 +                           ((double)done_t - vbl) / VBL_NS_PER_MS,
 +                           ((double)wake_t - vbl) / VBL_NS_PER_MS,
 +                           ((double)sub_t - vbl) / VBL_NS_PER_MS,
-+                           call / VBL_NS_PER_MS, swapw / VBL_NS_PER_MS,
++                           call / VBL_NS_PER_MS, p->pll_vk_submit / VBL_NS_PER_MS,
++                           p->pll_vk_present / VBL_NS_PER_MS, swapw / VBL_NS_PER_MS,
 +                           (double)(wake_t - done_t) / VBL_NS_PER_MS,
 +                           p->pll_plan / VBL_NS_PER_MS, vo_t / VBL_NS_PER_MS,
 +                           p->pll_wake_err / VBL_NS_PER_MS);
@@ -1463,7 +1673,7 @@ index 43bdcf2..5fdf6c2 100644
      ra_vk_ctx_uninit(ctx);
      mpvk_uninit(&p->vk);
      vo_w32_uninit(ctx->vo);
-@@ -84,9 +1254,51 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -84,9 +1425,51 @@ static bool win_init(struct ra_ctx *ctx)
           .hwnd = vo_w32_hwnd(ctx->vo),
      };
  
@@ -1515,6 +1725,18 @@ index 43bdcf2..5fdf6c2 100644
      };
  
      VkInstance inst = vk->vkinst->instance;
+@@ -96,6 +1479,11 @@ static bool win_init(struct ra_ctx *ctx)
+         goto error;
+     }
+ 
++    if (p->vbl && p->vbl_mode == 8 && vk->vkinst->get_proc_addr) {
++        vbl_vk_real_gipa = vk->vkinst->get_proc_addr;
++        vk->get_proc_addr = vbl_vk_gipa;
++    }
++
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto error;
+ 
 -- 
 2.43.0
 
