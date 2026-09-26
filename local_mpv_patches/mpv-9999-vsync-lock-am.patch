@@ -1,4 +1,4 @@
-From b2cbfa4038e998550d75dda1ebd1a55e5d1fdf20 Mon Sep 17 00:00:00 2001
+From 74f7ca6600e61502308200746d8d8dfe32979c99 Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
 Date: Thu, 24 Sep 2026 06:23:30 +0000
 Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
@@ -90,27 +90,28 @@ pl_swapchain_submit_frame (the rendering has already been flushed to the GPU
 by pl_gpu_flush at the end of draw_frame), and from the Vulkan context's
 submit_frame for vo_gpu. Contexts that do not set the hook are unaffected.
 ---
- video/out/gpu/context.h        |    8 +
- video/out/vo_gpu_next.c        |    2 +
- video/out/vulkan/context.c     |    9 +
- video/out/vulkan/context_win.c | 1061 ++++++++++++++++++++++++++++++++
- 4 files changed, 1080 insertions(+)
+ video/out/gpu/context.h        |   13 +
+ video/out/vo_gpu_next.c        |    4 +
+ video/out/vulkan/context.c     |   21 +-
+ video/out/vulkan/context_win.c | 1206 ++++++++++++++++++++++++++++++++
+ 4 files changed, 1243 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/gpu/context.h b/video/out/gpu/context.h
-index 6c5d008..7c747e8 100644
+index 6c5d008..4f4b385 100644
 --- a/video/out/gpu/context.h
 +++ b/video/out/gpu/context.h
-@@ -88,6 +88,9 @@ struct ra_ctx_params {
+@@ -88,6 +88,10 @@ struct ra_ctx_params {
      // ra_gl_ctx_swap_buffers. Required unless you either never call that
      // function or if you override it yourself.
      void (*swap_buffers)(struct ra_ctx *ctx);
 +
-+    // See ra_swapchain_fns.pre_present. Optional.
++    // See ra_swapchain_fns.pre_present/post_present. Optional.
 +    void (*pre_present)(struct ra_ctx *ctx);
++    void (*post_present)(struct ra_ctx *ctx);
  };
  
  // Extra struct for the swapchain-related functions so they can be easily
-@@ -130,6 +133,11 @@ struct ra_swapchain_fns {
+@@ -130,6 +134,15 @@ struct ra_swapchain_fns {
      // swapchains smart enough to do something with it.
      bool (*submit_frame)(struct ra_swapchain *sw, const struct vo_frame *frame);
  
@@ -119,14 +120,18 @@ index 6c5d008..7c747e8 100644
 +    // present happens without holding back the rendering. Optional.
 +    void (*pre_present)(struct ra_swapchain *sw);
 +
++    // Called right after the present has been queued, before swap_buffers
++    // (which may block on earlier frames). Optional.
++    void (*post_present)(struct ra_swapchain *sw);
++
      // Performs a buffer swap. This blocks for as long as necessary to meet
      // params.swapchain_depth, or until the next vblank (for vsynced contexts)
      void (*swap_buffers)(struct ra_swapchain *sw);
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 308a9fb..ea27156 100644
+index 308a9fb..22d9e8c 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1514,6 +1514,8 @@ static void flip_page(struct vo *vo)
+@@ -1514,8 +1514,12 @@ static void flip_page(struct vo *vo)
      struct ra_swapchain *sw = p->ra_ctx->swapchain;
  
      if (p->frame_pending) {
@@ -134,12 +139,16 @@ index 308a9fb..ea27156 100644
 +            sw->fns->pre_present(sw);
          if (!pl_swapchain_submit_frame(p->sw))
              MP_ERR(vo, "Failed presenting frame!\n");
++        if (sw->fns->post_present)
++            sw->fns->post_present(sw);
          p->frame_pending = false;
+     }
+ 
 diff --git a/video/out/vulkan/context.c b/video/out/vulkan/context.c
-index d062ea8..8c2fd81 100644
+index d062ea8..0e7169b 100644
 --- a/video/out/vulkan/context.c
 +++ b/video/out/vulkan/context.c
-@@ -522,9 +522,17 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
+@@ -522,10 +522,27 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
      return true;
  }
  
@@ -150,23 +159,35 @@ index d062ea8..8c2fd81 100644
 +        p->params.pre_present(sw->ctx);
 +}
 +
++static void post_present(struct ra_swapchain *sw)
++{
++    struct priv *p = sw->priv;
++    if (p->params.post_present)
++        p->params.post_present(sw->ctx);
++}
++
  static bool submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
  {
      struct priv *p = sw->priv;
+-    return pl_swapchain_submit_frame(p->vk->swapchain);
 +    pre_present(sw);
-     return pl_swapchain_submit_frame(p->vk->swapchain);
++    bool ok = pl_swapchain_submit_frame(p->vk->swapchain);
++    post_present(sw);
++    return ok;
  }
  
-@@ -589,6 +597,7 @@ static const struct ra_swapchain_fns vulkan_swapchain = {
+ static void swap_buffers(struct ra_swapchain *sw)
+@@ -589,6 +606,8 @@ static const struct ra_swapchain_fns vulkan_swapchain = {
      .target_csp    = target_csp,
      .start_frame   = start_frame,
      .submit_frame  = submit_frame,
 +    .pre_present   = pre_present,
++    .post_present  = post_present,
      .swap_buffers  = swap_buffers,
      .get_vsync     = get_vsync,
  };
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..67cc2d8 100644
+index 43bdcf2..60f913e 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,6 +15,13 @@
@@ -183,7 +204,7 @@ index 43bdcf2..67cc2d8 100644
  #include "video/out/gpu/context.h"
  #include "video/out/gpu/d3d11_helpers.h"
  #include "video/out/w32_common.h"
-@@ -26,15 +33,1033 @@
+@@ -26,15 +33,1168 @@
  EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
  
@@ -674,6 +695,13 @@ index 43bdcf2..67cc2d8 100644
 +    HANDLE pll_timer;
 +    bool pll_timer_hires;
 +    bool pll_held;              // the last report was held back (vbl_pll_report)
++    // Mode 8 timestamps of the current frame (mp_time_ns, 0 = unset).
++    int64_t pll_pre;            // pre_present entered (VO done rendering)
++    int64_t pll_wake;           // timer sleep ended, present issued right after
++    int64_t pll_sub;            // present queued (vkQueuePresentKHR returned)
++    int64_t pll_swap_prev;      // previous swap_buffers returned
++    double pll_plan;            // sleep the timer asked for (ns)
++    double pll_wake_err;        // phase error at pll_wake (ns), > 0: late
 +
 +    // Feedback for the swap that just finished.
 +    bool fb_valid;
@@ -688,6 +716,10 @@ index 43bdcf2..67cc2d8 100644
 +    double st_off_sum, st_off_max, st_wait_sum, st_wait_max, st_period;
 +    unsigned st_pll_n;
 +    double st_pll_err_sum, st_pll_err_absmax;
++    // Mode 8: present call (wake -> queued), swap_buffers wait (queued ->
++    // returned), VO time outside flip_page (previous swap -> pre_present).
++    unsigned st_pp_n, st_late_lines, st_late_hidden;
++    double st_call_sum, st_call_max, st_swapw_sum, st_swapw_max, st_vo_sum, st_vo_max;
  };
  
 +static void vbl_log_stats(struct ra_ctx *ctx, int64_t now, uint64_t missed)
@@ -720,6 +752,19 @@ index 43bdcf2..67cc2d8 100644
 +                   p->pll.margin / VBL_NS_PER_MS);
 +        p->st_pll_n = 0;
 +        p->st_pll_err_sum = p->st_pll_err_absmax = 0;
++    }
++    if (p->vbl_mode == 8) {
++        unsigned m = p->st_pp_n ? p->st_pp_n : 1;
++        MP_VERBOSE(ctx, "vsync-lock: present call mean %.2f ms max %.2f ms, "
++                   "swap wait mean %.2f ms max %.2f ms, vo mean %.2f ms max %.2f ms, "
++                   "late lines %u (+%u not shown)\n",
++                   p->st_call_sum / m / VBL_NS_PER_MS, p->st_call_max / VBL_NS_PER_MS,
++                   p->st_swapw_sum / m / VBL_NS_PER_MS, p->st_swapw_max / VBL_NS_PER_MS,
++                   p->st_vo_sum / m / VBL_NS_PER_MS, p->st_vo_max / VBL_NS_PER_MS,
++                   p->st_late_lines, p->st_late_hidden);
++        p->st_pp_n = p->st_late_lines = p->st_late_hidden = 0;
++        p->st_call_sum = p->st_call_max = p->st_swapw_sum = p->st_swapw_max = 0;
++        p->st_vo_sum = p->st_vo_max = 0;
 +    }
 +    p->st_begin = now;
 +    p->st_missed_base = missed;
@@ -993,12 +1038,36 @@ index 43bdcf2..67cc2d8 100644
 +    Sleep((DWORD)(ns / VBL_NS_PER_MS));
 +}
 +
++// Feed one phase error into VsyncLock's lock state and the statistics.
++static void vbl_pll_account(struct ra_ctx *ctx, double err, double period)
++{
++    struct priv *p = ctx->priv;
++    switch (vbl_pll_update(&p->pll, err)) {
++    case 1:
++        MP_VERBOSE(ctx, "vsync-lock: locked to host %.4f Hz, margin %.2f ms\n",
++                   1e9 / period, p->pll.margin / VBL_NS_PER_MS);
++        break;
++    case -1:
++        MP_VERBOSE(ctx, "vsync-lock: phase error %.2f ms, re-acquiring\n",
++                   p->pll.err_avg / VBL_NS_PER_MS);
++        break;
++    }
++    p->st_pll_n++;
++    p->st_pll_err_sum += err;
++    p->st_pll_err_absmax = fmax(p->st_pll_err_absmax, fabs(err));
++}
++
 +// One iteration of shadPS4's present loop: AccurateTimer::End() for the
 +// previous iteration, AccurateTimer::Start() (sleep off the slack) and
 +// SetTargetInterval(VsyncLock::NextInterval()) for this one. Without a settled
 +// host vblank estimate the timer is stopped and nothing is held back.
 +// Mode 7 runs it at the top of draw_frame, mode 8 right before the present.
-+static void vbl_pll_tick(struct ra_ctx *ctx)
++//
++// Mode 8 takes the phase error here, right after the sleep, exactly where
++// shadPS4's NextInterval() takes it (the present follows immediately), and
++// applies it to this iteration's interval. Mode 7 takes it after the present
++// (win_swap_buffers_pll), since rendering still follows its wake-up.
++static void vbl_pll_tick(struct ra_ctx *ctx, bool err_at_wake)
 +{
 +    struct priv *p = ctx->priv;
 +    struct vbl_shared *s = p->vbl;
@@ -1017,15 +1086,31 @@ index 43bdcf2..67cc2d8 100644
 +        if (pl->locked)
 +            MP_VERBOSE(ctx, "vsync-lock: lost (no host vblank)\n");
 +        vbl_pll_reset(pl);
++        p->pll_wake = 0;
 +        return;
 +    }
 +
 +    vbl_pll_timer_end(pl, now);
 +    double begin = now;
-+    if (pl->start > 0 && pl->total_wait > 0)
-+        vbl_pll_sleep(p, fmin(pl->total_wait, 2 * host));
++    double plan = 0;
++    if (pl->start > 0 && pl->total_wait > 0) {
++        plan = fmin(pl->total_wait, 2 * host);
++        vbl_pll_sleep(p, plan);
++    }
 +    pl->start = (double)mp_time_ns();
 +    pl->total_wait -= pl->start - begin;
++
++    if (err_at_wake) {
++        EnterCriticalSection(&s->lock);
++        double phase = s->est.phase;
++        host = s->est.period > 0 ? s->est.period : host;
++        LeaveCriticalSection(&s->lock);
++        double err = vbl_pll_phase_err(pl->start, phase, host, pl->margin);
++        vbl_pll_account(ctx, err, host);
++        p->pll_wake = (int64_t)pl->start;
++        p->pll_plan = plan;
++        p->pll_wake_err = err;
++    }
 +    pl->interval = vbl_pll_next_interval(pl, host);
 +
 +    double wait = pl->start - begin;
@@ -1036,7 +1121,7 @@ index 43bdcf2..67cc2d8 100644
 +// Mode 7: the timer paces the whole VO iteration (it holds back rendering).
 +static bool win_check_visible_pll(struct ra_ctx *ctx)
 +{
-+    vbl_pll_tick(ctx);
++    vbl_pll_tick(ctx, false);
 +    return true;
 +}
 +
@@ -1046,11 +1131,24 @@ index 43bdcf2..67cc2d8 100644
 +// its slot, like a flip request in shadPS4's present thread.
 +static void win_pre_present_pll(struct ra_ctx *ctx)
 +{
-+    vbl_pll_tick(ctx);
++    struct priv *p = ctx->priv;
++    p->pll_pre = mp_time_ns();
++    p->pll_sub = 0;
++    vbl_pll_tick(ctx, true);
 +}
 +
-+// Mode 7, after the present: measure the phase for the lock and report the
-+// vblank to vo.c (see vbl_pll_report()).
++// Mode 8: the present has been queued. This, not the return of swap_buffers
++// (which then blocks until an earlier frame's GPU work has completed), is when
++// the image entered the mailbox.
++static void win_post_present_pll(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    p->pll_sub = mp_time_ns();
++}
++
++// Modes 7 and 8, after the present: report the vblank to vo.c (see
++// vbl_pll_report()). Mode 7 also measures the phase for the lock here; mode 8
++// has done that at the wake-up and only uses the time the present was queued.
 +static void win_swap_buffers_pll(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
@@ -1060,7 +1158,19 @@ index 43bdcf2..67cc2d8 100644
 +    if (!s)
 +        return;
 +
-+    int64_t arrive = mp_time_ns();
++    int64_t done = mp_time_ns();
++    bool m8 = p->vbl_mode == 8;
++    int64_t swap_prev = p->pll_swap_prev;
++    p->pll_swap_prev = done;
++    // Mode 8: the frame counts from when its present was queued. Without a
++    // present (nothing rendered) there is nothing to report.
++    bool have_times = m8 && p->pll_sub > 0 && p->pll_wake > 0 && p->pll_pre > 0;
++    int64_t arrive = m8 && p->pll_sub > 0 ? p->pll_sub : done;
++    int64_t sub_t = p->pll_sub, wake_t = p->pll_wake, pre_t = p->pll_pre;
++    p->pll_sub = p->pll_wake = p->pll_pre = 0;
++    if (m8 && !sub_t)
++        return;
++
 +    EnterCriticalSection(&s->lock);
 +    struct vbl_est *e = &s->est;
 +
@@ -1074,7 +1184,7 @@ index 43bdcf2..67cc2d8 100644
 +        p->vbl_have_prev = false;
 +        p->pll_held = false;
 +        p->st_nofb++;
-+        vbl_log_stats(ctx, arrive, missed);
++        vbl_log_stats(ctx, done, missed);
 +        return;
 +    }
 +
@@ -1100,6 +1210,8 @@ index 43bdcf2..67cc2d8 100644
 +    uint64_t missed = e->missed;
 +    LeaveCriticalSection(&s->lock);
 +
++    bool had_prev = p->vbl_have_prev;
++    int64_t expected = (int64_t)p->vbl_prev_target + 1 + (int64_t)p->pll.dropped;
 +    int64_t report = vbl_pll_report(p->vbl_have_prev, (int64_t)p->vbl_prev_target,
 +                                    &p->pll_held, p->pll.dropped, shown_at);
 +    int64_t skipped = p->vbl_have_prev ? report - (int64_t)p->vbl_prev_target - 1 : 0;
@@ -1120,16 +1232,45 @@ index 43bdcf2..67cc2d8 100644
 +        p->vbl_reported_active = true;
 +    }
 +
-+    double err = vbl_pll_phase_err((double)arrive, phase, period, p->pll.margin);
-+    switch (vbl_pll_update(&p->pll, err)) {
-+    case 1:
-+        MP_VERBOSE(ctx, "vsync-lock: locked to host %.4f Hz, margin %.2f ms\n",
-+                   1e9 / period, p->pll.margin / VBL_NS_PER_MS);
-+        break;
-+    case -1:
-+        MP_VERBOSE(ctx, "vsync-lock: phase error %.2f ms, re-acquiring\n",
-+                   p->pll.err_avg / VBL_NS_PER_MS);
-+        break;
++    if (!m8)
++        vbl_pll_account(ctx, vbl_pll_phase_err((double)arrive, phase, period, p->pll.margin),
++                        period);
++
++    // Mode 8: one line per present that missed its vblank, with where the
++    // time went. Times are relative to the vblank the frame was meant for
++    // (> 0: after it). "vo" is the time between the previous swap_buffers
++    // return and this pre_present (waiting for the frame, rendering).
++    if (have_times) {
++        double call = (double)(sub_t - wake_t);
++        double swapw = (double)(done - sub_t);
++        double vo_t = swap_prev > 0 ? (double)(pre_t - swap_prev) : 0;
++        p->st_pp_n++;
++        p->st_call_sum += call;
++        p->st_call_max = fmax(p->st_call_max, call);
++        p->st_swapw_sum += swapw;
++        p->st_swapw_max = fmax(p->st_swapw_max, swapw);
++        p->st_vo_sum += vo_t;
++        p->st_vo_max = fmax(p->st_vo_max, vo_t);
++        if (had_prev && shown_at > expected) {
++            if (p->st_late_lines < 30) {
++                double vbl = phase + (double)(expected - (int64_t)seq) * period;
++                MP_VERBOSE(ctx, "vsync-lock: late present: +%lld vblank, "
++                           "pre_present %+.2f ms, wake %+.2f ms, queued %+.2f ms "
++                           "(present call %.2f ms), swap wait %.2f ms, "
++                           "sleep %.2f ms (planned %.2f), vo %.2f ms, wake err %+.2f ms\n",
++                           (long long)(shown_at - expected),
++                           ((double)pre_t - vbl) / VBL_NS_PER_MS,
++                           ((double)wake_t - vbl) / VBL_NS_PER_MS,
++                           ((double)sub_t - vbl) / VBL_NS_PER_MS,
++                           call / VBL_NS_PER_MS, swapw / VBL_NS_PER_MS,
++                           (double)(wake_t - pre_t) / VBL_NS_PER_MS,
++                           p->pll_plan / VBL_NS_PER_MS, vo_t / VBL_NS_PER_MS,
++                           p->pll_wake_err / VBL_NS_PER_MS);
++                p->st_late_lines++;
++            } else {
++                p->st_late_hidden++;
++            }
++        }
 +    }
 +
 +    // "late" counts presents that missed the vblank they were meant for
@@ -1143,23 +1284,35 @@ index 43bdcf2..67cc2d8 100644
 +    p->st_off_sum += offset;
 +    p->st_off_max = MPMAX(p->st_off_max, offset);
 +    p->st_period = period;
-+    p->st_pll_n++;
-+    p->st_pll_err_sum += err;
-+    p->st_pll_err_absmax = fmax(p->st_pll_err_absmax, fabs(err));
-+    vbl_log_stats(ctx, arrive, missed);
++    vbl_log_stats(ctx, done, missed);
 +}
 +
 +// MPV_VSYNC_LOCK_MARGIN_MS: how long before the host vblank to present in
 +// mode 7 (1 - 50 ms, default 6 as in shadPS4).
-+static double vbl_get_margin(void)
++static bool vbl_parse_env(const char *env, long *out)
++{
++    char *end = NULL;
++    long v = strtol(env, &end, 10);
++    if (end == env)
++        return false;
++    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
++        end++;
++    if (*end)
++        return false;
++    *out = v;
++    return true;
++}
++
++static double vbl_get_margin(bool *invalid)
 +{
 +    const char *env = getenv("MPV_VSYNC_LOCK_MARGIN_MS");
-+    long v = 6;
++    long v = 6, x;
 +    if (env && env[0]) {
-+        char *end = NULL;
-+        long x = strtol(env, &end, 10);
-+        if (end != env && !*end)
++        if (vbl_parse_env(env, &x)) {
 +            v = x < 1 ? 1 : x > 50 ? 50 : x;
++        } else {
++            *invalid = true;
++        }
 +    }
 +    return (double)v * VBL_NS_PER_MS;
 +}
@@ -1180,16 +1333,19 @@ index 43bdcf2..67cc2d8 100644
 +//      MPV_VSYNC_LOCK_MARGIN_MS before the host vblank; nothing waits for
 +//      the vblank itself
 +//   8  as 7, but the timer holds back only the present, not the rendering
-+//      (the structure of shadPS4's present thread)
-+static int vbl_get_mode(void)
++//      (the structure of shadPS4's present thread); the phase error is taken
++//      right after the timer sleep as in shadPS4, the reported vblank from
++//      when the present was queued
++static int vbl_get_mode(bool *invalid)
 +{
 +    const char *env = getenv("MPV_VSYNC_LOCK");
++    long v;
 +    if (!env || !env[0])
 +        return 3;
-+    char *end = NULL;
-+    long v = strtol(env, &end, 10);
-+    if (end == env || *end || v < 0 || v > 8 || v == 6)
++    if (!vbl_parse_env(env, &v) || v < 0 || v > 8 || v == 6) {
++        *invalid = true;
 +        return 3;
++    }
 +    return (int)v;
 +}
 +
@@ -1217,11 +1373,16 @@ index 43bdcf2..67cc2d8 100644
      ra_vk_ctx_uninit(ctx);
      mpvk_uninit(&p->vk);
      vo_w32_uninit(ctx->vo);
-@@ -84,9 +1109,45 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -84,9 +1244,55 @@ static bool win_init(struct ra_ctx *ctx)
           .hwnd = vo_w32_hwnd(ctx->vo),
      };
  
-+    p->vbl_mode = vbl_get_mode();
++    bool bad_mode = false, bad_margin = false;
++    p->vbl_mode = vbl_get_mode(&bad_mode);
++    if (bad_mode) {
++        MP_WARN(ctx, "vsync-lock: invalid MPV_VSYNC_LOCK '%s', using 3\n",
++                getenv("MPV_VSYNC_LOCK"));
++    }
 +    p->vbl = p->vbl_mode >= 1 ? vbl_start(ctx, vo_w32_hwnd(ctx->vo)) : NULL;
 +    static const char *const vbl_mode_names[] = {
 +        "off", "watcher only", "watcher + pacing", "watcher + pacing + feedback",
@@ -1233,7 +1394,11 @@ index 43bdcf2..67cc2d8 100644
 +    bool vbl_pll = p->vbl_mode == 7 || p->vbl_mode == 8;
 +    bool vbl_fb = p->vbl_mode == 3 || p->vbl_mode == 5 || vbl_pll;
 +    if (p->vbl && vbl_pll) {
-+        p->pll.margin = vbl_get_margin();
++        p->pll.margin = vbl_get_margin(&bad_margin);
++        if (bad_margin) {
++            MP_WARN(ctx, "vsync-lock: invalid MPV_VSYNC_LOCK_MARGIN_MS '%s', using 6\n",
++                    getenv("MPV_VSYNC_LOCK_MARGIN_MS"));
++        }
 +        p->pll_timer = CreateWaitableTimerExW(NULL, NULL,
 +            CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
 +            TIMER_ALL_ACCESS);
@@ -1256,6 +1421,7 @@ index 43bdcf2..67cc2d8 100644
 +                         : p->vbl_mode == 7 ? win_check_visible_pll
 +                         : vbl_pre ? win_check_visible : NULL,
 +        .pre_present = p->vbl && p->vbl_mode == 8 ? win_pre_present_pll : NULL,
++        .post_present = p->vbl && p->vbl_mode == 8 ? win_post_present_pll : NULL,
 +        .swap_buffers = !p->vbl || p->vbl_mode < 2 ? NULL
 +                        : vbl_pll ? win_swap_buffers_pll
 +                        : vbl_pre ? win_swap_buffers_pre : win_swap_buffers,
