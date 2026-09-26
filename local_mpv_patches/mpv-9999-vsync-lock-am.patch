@@ -1,4 +1,4 @@
-From 74f7ca6600e61502308200746d8d8dfe32979c99 Mon Sep 17 00:00:00 2001
+From 2d379ba29919926a72cb83935d16b446cf6733fb Mon Sep 17 00:00:00 2001
 From: local <local@example.invalid>
 Date: Thu, 24 Sep 2026 06:23:30 +0000
 Subject: [PATCH] vo/vulkan/win: lock presentation to the host vblank for
@@ -93,8 +93,8 @@ submit_frame for vo_gpu. Contexts that do not set the hook are unaffected.
  video/out/gpu/context.h        |   13 +
  video/out/vo_gpu_next.c        |    4 +
  video/out/vulkan/context.c     |   21 +-
- video/out/vulkan/context_win.c | 1206 ++++++++++++++++++++++++++++++++
- 4 files changed, 1243 insertions(+), 1 deletion(-)
+ video/out/vulkan/context_win.c | 1240 ++++++++++++++++++++++++++++++++
+ 4 files changed, 1277 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/gpu/context.h b/video/out/gpu/context.h
 index 6c5d008..4f4b385 100644
@@ -187,7 +187,7 @@ index d062ea8..0e7169b 100644
      .get_vsync     = get_vsync,
  };
 diff --git a/video/out/vulkan/context_win.c b/video/out/vulkan/context_win.c
-index 43bdcf2..60f913e 100644
+index 43bdcf2..7cfd2b4 100644
 --- a/video/out/vulkan/context_win.c
 +++ b/video/out/vulkan/context_win.c
 @@ -15,6 +15,13 @@
@@ -204,7 +204,7 @@ index 43bdcf2..60f913e 100644
  #include "video/out/gpu/context.h"
  #include "video/out/gpu/d3d11_helpers.h"
  #include "video/out/w32_common.h"
-@@ -26,15 +33,1168 @@
+@@ -26,15 +33,1202 @@
  EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
  
@@ -697,6 +697,7 @@ index 43bdcf2..60f913e 100644
 +    bool pll_held;              // the last report was held back (vbl_pll_report)
 +    // Mode 8 timestamps of the current frame (mp_time_ns, 0 = unset).
 +    int64_t pll_pre;            // pre_present entered (VO done rendering)
++    int64_t pll_done;           // the frame's GPU work had completed
 +    int64_t pll_wake;           // timer sleep ended, present issued right after
 +    int64_t pll_sub;            // present queued (vkQueuePresentKHR returned)
 +    int64_t pll_swap_prev;      // previous swap_buffers returned
@@ -720,6 +721,10 @@ index 43bdcf2..60f913e 100644
 +    // returned), VO time outside flip_page (previous swap -> pre_present).
 +    unsigned st_pp_n, st_late_lines, st_late_hidden;
 +    double st_call_sum, st_call_max, st_swapw_sum, st_swapw_max, st_vo_sum, st_vo_max;
++    // Mode 8: GPU completion of the frame (pre_present -> done), and how
++    // often it completed after the planned present / after the vblank.
++    double st_gpu_sum, st_gpu_max;
++    unsigned st_gpu_after_target, st_gpu_after_vblank;
  };
  
 +static void vbl_log_stats(struct ra_ctx *ctx, int64_t now, uint64_t missed)
@@ -762,6 +767,12 @@ index 43bdcf2..60f913e 100644
 +                   p->st_swapw_sum / m / VBL_NS_PER_MS, p->st_swapw_max / VBL_NS_PER_MS,
 +                   p->st_vo_sum / m / VBL_NS_PER_MS, p->st_vo_max / VBL_NS_PER_MS,
 +                   p->st_late_lines, p->st_late_hidden);
++        MP_VERBOSE(ctx, "vsync-lock: gpu done wait mean %.2f ms max %.2f ms, "
++                   "done after planned present %u, after vblank %u\n",
++                   p->st_gpu_sum / m / VBL_NS_PER_MS, p->st_gpu_max / VBL_NS_PER_MS,
++                   p->st_gpu_after_target, p->st_gpu_after_vblank);
++        p->st_gpu_sum = p->st_gpu_max = 0;
++        p->st_gpu_after_target = p->st_gpu_after_vblank = 0;
 +        p->st_pp_n = p->st_late_lines = p->st_late_hidden = 0;
 +        p->st_call_sum = p->st_call_max = p->st_swapw_sum = p->st_swapw_max = 0;
 +        p->st_vo_sum = p->st_vo_max = 0;
@@ -1129,11 +1140,21 @@ index 43bdcf2..60f913e 100644
 +// core wake-up and the filter chain that vo.c triggers right before
 +// draw_frame, run exactly as without the lock; the finished image waits for
 +// its slot, like a flip request in shadPS4's present thread.
++//
++// Before the timer, wait until the frame's own GPU work (rendering and the
++// hwdec interop it waits on) has completed. The present cannot reach the
++// screen before that anyway, so this only moves a wait that would otherwise
++// happen on the GPU (or inside vkQueuePresentKHR) to the CPU, where its end
++// can be measured; the timer then sleeps off only what is left of the slack.
++// This waits for libplacebo's own command buffers only, not the device.
 +static void win_pre_present_pll(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
 +    p->pll_pre = mp_time_ns();
 +    p->pll_sub = 0;
++    if (p->vk.gpu)
++        pl_gpu_finish(p->vk.gpu);
++    p->pll_done = mp_time_ns();
 +    vbl_pll_tick(ctx, true);
 +}
 +
@@ -1167,7 +1188,8 @@ index 43bdcf2..60f913e 100644
 +    bool have_times = m8 && p->pll_sub > 0 && p->pll_wake > 0 && p->pll_pre > 0;
 +    int64_t arrive = m8 && p->pll_sub > 0 ? p->pll_sub : done;
 +    int64_t sub_t = p->pll_sub, wake_t = p->pll_wake, pre_t = p->pll_pre;
-+    p->pll_sub = p->pll_wake = p->pll_pre = 0;
++    int64_t done_t = p->pll_done;
++    p->pll_sub = p->pll_wake = p->pll_pre = p->pll_done = 0;
 +    if (m8 && !sub_t)
 +        return;
 +
@@ -1239,8 +1261,20 @@ index 43bdcf2..60f913e 100644
 +    // Mode 8: one line per present that missed its vblank, with where the
 +    // time went. Times are relative to the vblank the frame was meant for
 +    // (> 0: after it). "vo" is the time between the previous swap_buffers
-+    // return and this pre_present (waiting for the frame, rendering).
++    // return and this pre_present (waiting for the frame, recording and
++    // submitting the rendering); "gpu done" is when that rendering had
++    // actually completed on the GPU.
 +    if (have_times) {
++        double vbl = phase + (double)(expected - (int64_t)seq) * period;
++        double gpu = (double)(done_t - pre_t);
++        p->st_gpu_sum += gpu;
++        p->st_gpu_max = fmax(p->st_gpu_max, gpu);
++        if (had_prev) {
++            if ((double)done_t > vbl - p->pll.margin)
++                p->st_gpu_after_target++;
++            if ((double)done_t > vbl)
++                p->st_gpu_after_vblank++;
++        }
 +        double call = (double)(sub_t - wake_t);
 +        double swapw = (double)(done - sub_t);
 +        double vo_t = swap_prev > 0 ? (double)(pre_t - swap_prev) : 0;
@@ -1253,17 +1287,17 @@ index 43bdcf2..60f913e 100644
 +        p->st_vo_max = fmax(p->st_vo_max, vo_t);
 +        if (had_prev && shown_at > expected) {
 +            if (p->st_late_lines < 30) {
-+                double vbl = phase + (double)(expected - (int64_t)seq) * period;
 +                MP_VERBOSE(ctx, "vsync-lock: late present: +%lld vblank, "
-+                           "pre_present %+.2f ms, wake %+.2f ms, queued %+.2f ms "
++                           "pre_present %+.2f ms, gpu done %+.2f ms, wake %+.2f ms, queued %+.2f ms "
 +                           "(present call %.2f ms), swap wait %.2f ms, "
 +                           "sleep %.2f ms (planned %.2f), vo %.2f ms, wake err %+.2f ms\n",
 +                           (long long)(shown_at - expected),
 +                           ((double)pre_t - vbl) / VBL_NS_PER_MS,
++                           ((double)done_t - vbl) / VBL_NS_PER_MS,
 +                           ((double)wake_t - vbl) / VBL_NS_PER_MS,
 +                           ((double)sub_t - vbl) / VBL_NS_PER_MS,
 +                           call / VBL_NS_PER_MS, swapw / VBL_NS_PER_MS,
-+                           (double)(wake_t - pre_t) / VBL_NS_PER_MS,
++                           (double)(wake_t - done_t) / VBL_NS_PER_MS,
 +                           p->pll_plan / VBL_NS_PER_MS, vo_t / VBL_NS_PER_MS,
 +                           p->pll_wake_err / VBL_NS_PER_MS);
 +                p->st_late_lines++;
@@ -1373,7 +1407,7 @@ index 43bdcf2..60f913e 100644
      ra_vk_ctx_uninit(ctx);
      mpvk_uninit(&p->vk);
      vo_w32_uninit(ctx->vo);
-@@ -84,9 +1244,55 @@ static bool win_init(struct ra_ctx *ctx)
+@@ -84,9 +1278,55 @@ static bool win_init(struct ra_ctx *ctx)
           .hwnd = vo_w32_hwnd(ctx->vo),
      };
  
